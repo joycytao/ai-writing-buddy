@@ -873,19 +873,19 @@ General rules:
 
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fff8e7_0%,_#f5ebd7_42%,_#eadbc2_100%)] font-sans text-gray-800 p-4 md:p-6 flex flex-col items-center">
-      <header className="w-full max-w-5xl flex justify-between items-center py-4 mb-4">
-        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { setView('home'); setStep('idle'); }}>
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fff8e7_0%,_#f5ebd7_42%,_#eadbc2_100%)] font-sans text-gray-800 p-3 sm:p-4 md:p-6 flex flex-col items-center">
+      <header className="w-full max-w-5xl flex flex-col gap-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:py-4 mb-3 sm:mb-4">
+        <div className="flex min-w-0 items-center gap-2 cursor-pointer self-start" onClick={() => { setView('home'); setStep('idle'); }}>
           <div className="bg-gradient-to-br from-orange-500 to-amber-500 p-2.5 rounded-2xl shadow-lg shadow-orange-200">
             <BookOpen className="text-white" />
           </div>
-          <div>
+          <div className="min-w-0">
             <p className="text-[10px] md:text-xs uppercase tracking-[0.35em] text-orange-700/70 font-bold">Voice Writing Studio</p>
-            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
+            <h1 className="text-xl sm:text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
           </div>
         </div>
         
-        <div className="flex items-center gap-3">
+        <div className="flex w-full items-center justify-end gap-3 sm:w-auto">
           {isLocal && (
             <button 
               onClick={() => setIsMockMode(!isMockMode)}
@@ -898,7 +898,7 @@ General rules:
         </div>
       </header>
 
-      <main className="w-full max-w-5xl bg-[linear-gradient(180deg,_rgba(255,253,247,0.96),_rgba(255,247,235,0.94))] rounded-[2.25rem] shadow-[0_30px_80px_rgba(120,74,24,0.14)] ring-1 ring-white/80 p-6 md:p-10 relative overflow-hidden min-h-[620px] flex flex-col">
+      <main className="w-full max-w-5xl bg-[linear-gradient(180deg,_rgba(255,253,247,0.96),_rgba(255,247,235,0.94))] rounded-[1.75rem] sm:rounded-[2.25rem] shadow-[0_30px_80px_rgba(120,74,24,0.14)] ring-1 ring-white/80 p-4 sm:p-6 md:p-10 relative overflow-hidden min-h-[560px] sm:min-h-[620px] flex flex-col">
         <div className="pointer-events-none absolute inset-0">
           <div className="absolute -top-12 right-8 h-40 w-40 rounded-full bg-orange-200/30 blur-3xl" />
           <div className="absolute bottom-0 left-0 h-56 w-56 rounded-full bg-sky-200/25 blur-3xl" />
@@ -908,14 +908,14 @@ General rules:
         {view === 'setup' && (
           <div className="relative z-10 flex-1 animate-in fade-in zoom-in duration-300">
             <div className="grid gap-8 lg:grid-cols-[0.95fr_1.05fr] h-full">
-              <div className="rounded-[2.5rem] bg-stone-950 text-white p-8 md:p-10 shadow-[0_30px_60px_rgba(25,25,25,0.18)] flex flex-col justify-between">
+              <div className="rounded-[2rem] sm:rounded-[2.5rem] bg-stone-950 text-white p-6 sm:p-8 md:p-10 shadow-[0_30px_60px_rgba(25,25,25,0.18)] flex flex-col justify-between">
                 <div className="space-y-5">
                   <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.28em] text-amber-100/80">
                     <Settings size={14} />
                     Parent settings
                   </div>
                   <div className="space-y-3">
-                    <h2 className="text-4xl md:text-5xl font-black tracking-[-0.05em] leading-[0.95]">Tune the app for your child.</h2>
+                    <h2 className="text-3xl sm:text-4xl md:text-5xl font-black tracking-[-0.05em] leading-[0.95]">Tune the app for your child.</h2>
                     <p className="text-base md:text-lg leading-relaxed text-stone-300">
                       {getCombinedExpectationSummary(grade, customExpectation)}
                     </p>
@@ -929,14 +929,14 @@ General rules:
                 </div>
               </div>
 
-              <div className="rounded-[2.5rem] border border-white/80 bg-white/75 p-8 md:p-10 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
+              <div className="rounded-[2rem] sm:rounded-[2.5rem] border border-white/80 bg-white/75 p-5 sm:p-8 md:p-10 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
                 <div className="space-y-8">
-                  <div className="flex items-start justify-between gap-4">
+                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                     <div>
                       <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Student grade</p>
-                      <h3 className="mt-3 text-4xl font-black tracking-[-0.04em] text-stone-900">{grade}</h3>
+                      <h3 className="mt-3 text-3xl sm:text-4xl font-black tracking-[-0.04em] text-stone-900">{grade}</h3>
                     </div>
-                    <div className="rounded-[1.5rem] bg-orange-50 px-4 py-3 text-right shadow-sm ring-1 ring-orange-100">
+                    <div className="rounded-[1.5rem] bg-orange-50 px-4 py-3 text-left sm:text-right shadow-sm ring-1 ring-orange-100">
                       <p className="text-[11px] uppercase tracking-[0.24em] text-orange-500 font-black">Recommended</p>
                       <p className="mt-1 text-lg font-black text-orange-900">Ages {ageRanges[gradeValue] || '5-6'}</p>
                     </div>
@@ -1012,7 +1012,7 @@ General rules:
         {view === 'home' && (
           <div className="flex-1 flex flex-col justify-center text-center relative z-10">
             {step === 'idle' && (
-              <div className="animate-in fade-in slide-in-from-top-4 grid gap-8 lg:grid-cols-[1.2fr_0.8fr] items-center text-left">
+                <div className="animate-in fade-in slide-in-from-top-4 grid gap-8 lg:grid-cols-[1.2fr_0.8fr] items-center text-left">
                 <div className="space-y-6">
                   <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-white/75 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.3em] text-orange-700 shadow-sm">
                     <Sparkles size={14} className="text-orange-500" />
@@ -1020,7 +1020,7 @@ General rules:
                   </div>
 
                   <div className="space-y-4">
-                    <h2 className="max-w-2xl text-5xl md:text-6xl font-black text-stone-900 leading-[0.92] tracking-[-0.05em]">
+                    <h2 className="max-w-2xl text-4xl sm:text-5xl md:text-6xl font-black text-stone-900 leading-[0.92] tracking-[-0.05em]">
                       A softer start for little storytellers.
                     </h2>
                     <p className="max-w-xl text-lg md:text-xl leading-relaxed text-stone-600 font-medium">
@@ -1057,7 +1057,7 @@ General rules:
                   </div>
                 </div>
 
-                <div className="relative mx-auto w-full max-w-md">
+                  <div className="relative mx-auto w-full max-w-md self-start lg:self-auto">
                   <div className="absolute -inset-3 rounded-[2.5rem] bg-[linear-gradient(145deg,_rgba(255,255,255,0.75),_rgba(255,255,255,0.15))] blur-xl" />
                   <div className="relative overflow-hidden rounded-[2.5rem] border border-white/80 bg-stone-950 p-6 text-white shadow-[0_30px_60px_rgba(25,25,25,0.18)]">
                     <div className="flex items-center justify-between">
@@ -1111,7 +1111,7 @@ General rules:
                     <p className="text-lg md:text-xl text-stone-600 font-medium leading-relaxed">{getStepQuestion(step)}</p>
                   </div>
 
-                  <div className="rounded-[2rem] border border-white/80 bg-white/70 px-5 py-4 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm min-w-[220px]">
+                  <div className="w-full rounded-[2rem] border border-white/80 bg-white/70 px-5 py-4 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm min-w-0 sm:min-w-[220px] sm:w-auto">
                     <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Current mode</p>
                     <p className="mt-2 text-2xl font-black text-stone-900">{isConfirming ? 'Confirming' : 'Listening for ideas'}</p>
                     <p className="mt-2 text-sm leading-6 text-stone-600">
@@ -1153,15 +1153,15 @@ General rules:
                 </div>
                 
                 <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr] items-stretch">
-                  <div className={`p-8 md:p-10 rounded-[2.5rem] min-h-[220px] flex items-center text-left text-3xl md:text-4xl font-bold italic border transition-all duration-300 shadow-[0_18px_40px_rgba(148,101,47,0.08)] ${isConfirming ? 'bg-[linear-gradient(180deg,_#fff4e8,_#fff8f1)] text-orange-900 border-orange-100' : 'bg-[linear-gradient(180deg,_#eef7ff,_#f5fbff)] text-sky-900 border-sky-100'}`}>
+                  <div className={`p-6 sm:p-8 md:p-10 rounded-[2rem] sm:rounded-[2.5rem] min-h-[220px] flex items-center text-left text-2xl sm:text-3xl md:text-4xl font-bold italic border transition-all duration-300 shadow-[0_18px_40px_rgba(148,101,47,0.08)] ${isConfirming ? 'bg-[linear-gradient(180deg,_#fff4e8,_#fff8f1)] text-orange-900 border-orange-100' : 'bg-[linear-gradient(180deg,_#eef7ff,_#f5fbff)] text-sky-900 border-sky-100'}`}>
                     {userInput || (
-                      <span className="not-italic text-xl md:text-2xl font-semibold text-stone-400">
+                      <span className="not-italic text-lg sm:text-xl md:text-2xl font-semibold text-stone-400">
                         {isListening ? (isMockMode ? "Mocking input..." : "Listening for your answer...") : 'Tap the microphone and answer in your own words.'}
                       </span>
                     )}
                   </div>
 
-                  <div className="rounded-[2.5rem] border border-white/80 bg-white/75 p-6 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
+                  <div className="rounded-[2rem] sm:rounded-[2.5rem] border border-white/80 bg-white/75 p-5 sm:p-6 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
                     <div>
                       <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Why this helps</p>
                       <p className="mt-3 text-2xl font-black text-stone-900">
@@ -1214,9 +1214,9 @@ General rules:
 
             {step === 'result' && (
               <div className="w-full space-y-8 animate-in fade-in">
-                <div className="bg-orange-50 p-8 rounded-[2.5rem] border-4 border-orange-100 text-left relative shadow-inner">
+                <div className="bg-orange-50 p-5 sm:p-8 rounded-[2rem] sm:rounded-[2.5rem] border-4 border-orange-100 text-left relative shadow-inner">
                   <button onClick={() => speakText(generatedJournal)} className="absolute top-4 right-4 p-3 bg-white rounded-full shadow-md"><Volume2 className="text-orange-500 w-6 h-6" /></button>
-                  <p className="text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
+                  <p className="text-lg sm:text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
                 </div>
                 {/* Illustration preview intentionally disabled for now.
                 <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-8 border-white bg-gray-50 min-h-[300px] flex items-center justify-center">
@@ -1234,7 +1234,7 @@ General rules:
                   )}
                 </div>
                 */}
-                <div className="flex gap-4">
+                <div className="flex flex-col gap-4 sm:flex-row">
                   <button onClick={() => setStep('idle')} className="flex-1 py-5 bg-gray-100 rounded-2xl font-black text-gray-500">Restart</button>
                   <button onClick={() => setView('journaling')} className="flex-1 py-5 bg-green-500 text-white rounded-2xl font-black text-xl shadow-lg flex items-center justify-center gap-2">Start Writing <ChevronRight /></button>
                 </div>
@@ -1264,14 +1264,14 @@ General rules:
             </div>
 
             {/* Key Idea Area - Yellow Sticky Note Style */}
-            <div className="bg-yellow-50 p-6 rounded-[2rem] border-2 border-yellow-200 shadow-sm relative flex-shrink-0">
+            <div className="bg-yellow-50 p-5 sm:p-6 rounded-[1.75rem] sm:rounded-[2rem] border-2 border-yellow-200 shadow-sm relative flex-shrink-0">
                 <div className="flex justify-between items-center mb-2">
                     <p className="text-xs text-yellow-800 font-black uppercase tracking-widest">💡 Key Idea:</p>
                     <button onClick={() => speakText(generatedJournal)} className="p-2 bg-white rounded-full shadow-sm hover:scale-110 transition-transform">
                         <Volume2 className="text-orange-500 w-5 h-5" />
                     </button>
                 </div>
-                <p className="text-xl text-yellow-900 font-bold leading-relaxed pr-2 text-left">
+                <p className="text-lg sm:text-xl text-yellow-900 font-bold leading-relaxed pr-2 text-left">
                     {generatedJournal}
                 </p>
             </div>
@@ -1319,29 +1319,29 @@ General rules:
         )}
 
         {showUploadModal && (
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-xl z-50 flex items-center justify-center p-8 text-center">
-            <div className="bg-white w-full max-w-lg rounded-[4rem] p-12 shadow-2xl animate-in zoom-in duration-300">
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-xl z-50 flex items-center justify-center p-4 sm:p-8 text-center">
+            <div className="bg-white w-full max-w-lg rounded-[2.5rem] sm:rounded-[4rem] p-6 sm:p-8 md:p-12 shadow-2xl animate-in zoom-in duration-300">
               {!cameraMode ? (
                 <div className="space-y-10">
-                  <div className="w-28 h-28 bg-blue-100 rounded-full flex items-center justify-center mx-auto shadow-inner">
+                    <div className="w-24 h-24 sm:w-28 sm:h-28 bg-blue-100 rounded-full flex items-center justify-center mx-auto shadow-inner">
                     <Camera className="text-blue-600 w-14 h-14" />
                   </div>
                   <div className="space-y-4">
-                    <h3 className="text-4xl font-black text-gray-800 tracking-tighter">Save your paper?</h3>
-                    <p className="text-2xl text-gray-400 font-bold leading-tight">Take a photo of your paper journal!</p>
+                      <h3 className="text-3xl sm:text-4xl font-black text-gray-800 tracking-tighter">Save your paper?</h3>
+                      <p className="text-xl sm:text-2xl text-gray-400 font-bold leading-tight">Take a photo of your paper journal!</p>
                   </div>
                   <div className="flex flex-col gap-4">
-                    <button onClick={startCamera} className="py-7 bg-blue-500 text-white rounded-[2.5rem] font-black text-2xl flex items-center justify-center gap-4 shadow-xl hover:bg-blue-600">
+                    <button onClick={startCamera} className="py-5 sm:py-7 bg-blue-500 text-white rounded-[2rem] sm:rounded-[2.5rem] font-black text-lg sm:text-2xl flex items-center justify-center gap-3 sm:gap-4 shadow-xl hover:bg-blue-600">
                       <Camera size={32} /> Take a Photo
                     </button>
-                    <button onClick={() => uploadPhoto(false)} className="py-7 bg-gray-100 text-gray-500 rounded-[2.5rem] font-black text-2xl">
+                    <button onClick={() => uploadPhoto(false)} className="py-5 sm:py-7 bg-gray-100 text-gray-500 rounded-[2rem] sm:rounded-[2.5rem] font-black text-lg sm:text-2xl">
                       No, just save digital
                     </button>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-8">
-                  <div className="rounded-[3rem] overflow-hidden bg-black aspect-[3/4] relative border-8 border-gray-100 shadow-inner">
+                  <div className="rounded-[2rem] sm:rounded-[3rem] overflow-hidden bg-black aspect-[3/4] relative border-4 sm:border-8 border-gray-100 shadow-inner">
                     {!capturedImage ? (
                       <>
                         <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
@@ -1353,8 +1353,8 @@ General rules:
                   </div>
                   {capturedImage ? (
                     <div className="flex gap-4">
-                      <button onClick={() => {setCapturedImage(null); startCamera();}} className="flex-1 py-6 bg-gray-100 rounded-[2rem] font-black text-xl">Retake</button>
-                      <button onClick={() => uploadPhoto(true)} className="flex-1 py-6 bg-green-500 text-white rounded-[2rem] font-black text-xl flex items-center justify-center gap-3 shadow-lg">
+                      <button onClick={() => {setCapturedImage(null); startCamera();}} className="flex-1 py-5 sm:py-6 bg-gray-100 rounded-[1.75rem] sm:rounded-[2rem] font-black text-lg sm:text-xl">Retake</button>
+                      <button onClick={() => uploadPhoto(true)} className="flex-1 py-5 sm:py-6 bg-green-500 text-white rounded-[1.75rem] sm:rounded-[2rem] font-black text-lg sm:text-xl flex items-center justify-center gap-3 shadow-lg">
                         {isSaving ? <RefreshCw className="animate-spin" /> : <><Check size={28} /> Looks Great!</>}
                       </button>
                     </div>
@@ -1369,11 +1369,11 @@ General rules:
 
         {showCustomExpectationModal && (
           <div className="absolute inset-0 bg-black/45 backdrop-blur-xl z-50 flex items-center justify-center p-6 md:p-8 text-left">
-            <div className="w-full max-w-2xl rounded-[2.5rem] bg-white p-8 md:p-10 shadow-2xl animate-in zoom-in duration-300">
+            <div className="w-full max-w-2xl rounded-[2rem] sm:rounded-[2.5rem] bg-white p-5 sm:p-8 md:p-10 shadow-2xl animate-in zoom-in duration-300">
               <div className="space-y-6">
                 <div className="space-y-3">
                   <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Custom expectation</p>
-                  <h3 className="text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Writing Buddy what to prioritize.</h3>
+                  <h3 className="text-2xl sm:text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Writing Buddy what to prioritize.</h3>
                   <p className="text-base leading-7 text-stone-600">
                     Example: use shorter sentences, encourage more descriptive words, keep the tone gentle, or focus on confidence with punctuation.
                   </p>
@@ -1447,7 +1447,7 @@ General rules:
 
       </main>
 
-      <footer className="mt-10 text-center text-orange-300 font-bold">Built for {grade} Students • Step by Step Learning</footer>
+      <footer className="mt-8 px-4 text-center text-sm sm:text-base text-orange-300 font-bold">Built for {grade} Students • Step by Step Learning</footer>
     </div>
   );
 };
