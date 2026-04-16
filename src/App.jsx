@@ -19,7 +19,6 @@ import {
   ArrowLeft,
   FlaskConical,
   Sparkles,
-  ImageIcon,
   Camera
 } from 'lucide-react';
 
@@ -33,7 +32,7 @@ const firebaseConfig = {
   measurementId: "G-C16JH7BE95"
 };
 
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'journal-buddy-app';
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'writing-buddy-app';
 const googleAIKey = import.meta.env.VITE_GEMINI_API_KEY || '';
 
 const app = initializeApp(firebaseConfig);
@@ -254,7 +253,7 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
     setUserInput(''); 
     setStep('who');
     setIsConfirming(false);
-    setJournalImage(null);
+    // setJournalImage(null);
     speakAndListen("Awesome! Let's write. First, Who were you with today?");
   };
 
@@ -429,17 +428,20 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 - Write 3-4 connected complete sentences.
 - Use capitalization and ending punctuation consistently.
 - Stay on one clear topic with gentle adult-supported structure.
-- Prefer common sight words and decodable words.`,
+- Prefer common sight words and decodable words.
+- Make every sentence short and easy enough for a child to shadow write by copying line by line.`,
       'Grade 2': `2nd grade writing goals:
 - Write several sentences about one topic.
 - Use clear basic sentence structure.
 - Include simple temporal words such as "First," "Then," or "Next" when they fit.
-- Keep the writing easy to revise for clarity with guidance.`,
+- Keep the writing easy to revise for clarity with guidance.
+- Keep sentence length manageable so a child can shadow write it with support.`,
       'Grade 3': `3rd grade writing goals:
 - Write one organized paragraph with a topic sentence and relevant details.
 - Use linking words, capitalization, and punctuation consistently.
 - Add light description and natural story detail.
-- Keep the structure appropriate for a short narrative paragraph.`,
+- Keep the structure appropriate for a short narrative paragraph.
+- Keep the paragraph simple enough for a child to shadow write without overwhelming sentence length.`,
       'Grade 4': `4th grade writing goals:
 - Write a more structured multi-paragraph response.
 - Give a gentle introduction, supporting middle, and short conclusion.
@@ -526,6 +528,7 @@ General rules:
 - Keep all 5W1H details included, even if some need simple rewording.
 - Write in age-appropriate English for ${grade}.
 - Make it sound natural, warm, and child-centered.
+- For Grade 1, Grade 2, and Grade 3, make the journal easy for a child to shadow write by hand.
 - Do not add facts that were not given.
 - Output only the journal text, with no title, bullets, labels, or explanation.`;
 
@@ -566,44 +569,45 @@ General rules:
     }
   };
 
-  const generateImageWithGemini = async (journalText) => {
-      setIsGeneratingImage(true);
-      const promptText = `A cute, colorful children's book illustration for a kid's journal entry: ${journalText}. Bright colors, simple cartoon style, happy mood.`;
-      try {
-        const payload = {
-          contents: [{
-            parts: [{ text: `Generate a cute, colorful children's book illustration style image of: ${promptText} Draw like a kid's drawing.` }]
-          }],
-          generationConfig: {
-            responseModalities: ['TEXT', 'IMAGE']
-          }
-        };
+  // Illustration generation is intentionally disabled for now.
+  // const generateImageWithGemini = async (journalText) => {
+  //     setIsGeneratingImage(true);
+  //     const promptText = `A cute, colorful children's book illustration for a kid's journal entry: ${journalText}. Bright colors, simple cartoon style, happy mood.`;
+  //     try {
+  //       const payload = {
+  //         contents: [{
+  //           parts: [{ text: `Generate a cute, colorful children's book illustration style image of: ${promptText} Draw like a kid's drawing.` }]
+  //         }],
+  //         generationConfig: {
+  //           responseModalities: ['TEXT', 'IMAGE']
+  //         }
+  //       };
 
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+  //       const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+  //         method: 'POST',
+  //         headers: { 'Content-Type': 'application/json' },
+  //         body: JSON.stringify(payload)
+  //       });
 
-        if (!response.ok) throw new Error("Gemini image request failed");
+  //       if (!response.ok) throw new Error("Gemini image request failed");
 
-        const result = await response.json();
-        const base64Data = result.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData?.data;
-        if (base64Data) {
-          setJournalImage(`data:image/png;base64,${base64Data}`);
-          setImageUrl(`data:image/png;base64,${base64Data}`);
-        } else {
-          setJournalImage(null);
-          setImageUrl("https://placehold.co/600x400/orange/white?text=Your+Story+Illustration");
-        }
+  //       const result = await response.json();
+  //       const base64Data = result.candidates?.[0]?.content?.parts?.find((p) => p.inlineData)?.inlineData?.data;
+  //       if (base64Data) {
+  //         setJournalImage(`data:image/png;base64,${base64Data}`);
+  //         setImageUrl(`data:image/png;base64,${base64Data}`);
+  //       } else {
+  //         setJournalImage(null);
+  //         setImageUrl("https://placehold.co/600x400/orange/white?text=Your+Story+Illustration");
+  //       }
 
-      } catch (error) {
-        console.error("Banana Image Error:", error);
+  //     } catch (error) {
+  //       console.error("Banana Image Error:", error);
 
-      } finally {
-        setIsGeneratingImage(false);
-      }
-  };
+  //     } finally {
+  //       setIsGeneratingImage(false);
+  //     }
+  // };
 
 
   // const generateInstructionWithGemini = async (journalText) => {
@@ -641,44 +645,45 @@ General rules:
   //   }
   // };
 
-  const generateImageWithImagen = async (journalText) => {
-    
-     setIsGeneratingImage(true);
+  // Illustration generation is intentionally disabled for now.
+  // const generateImageWithImagen = async (journalText) => {
+  //   
+  //    setIsGeneratingImage(true);
 
-    const promptText = `Cute colorful cartoon illustration for a kid: ${journalText}. Bright and happy colors.`;
-    try {
-      
-      const payload = {
-        instances: [
-          { 
-            prompt: `A cute, colorful children's book illustration for a kid's journal entry: ${promptText}. Bright colors, simple cartoon style, happy mood.` 
-          }
-        ],
-        parameters: { 
-          sampleCount: 1 
-        }
-      };
-      
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${googleAIKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+  //   const promptText = `Cute colorful cartoon illustration for a kid: ${journalText}. Bright and happy colors.`;
+  //   try {
+  //     
+  //     const payload = {
+  //       instances: [
+  //         { 
+  //           prompt: `A cute, colorful children's book illustration for a kid's journal entry: ${promptText}. Bright colors, simple cartoon style, happy mood.` 
+  //         }
+  //       ],
+  //       parameters: { 
+  //         sampleCount: 1 
+  //       }
+  //     };
+  //     
+  //     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=${googleAIKey}`, {
+  //       method: 'POST',
+  //       headers: { 'Content-Type': 'application/json' },
+  //       body: JSON.stringify(payload)
+  //     });
 
-      const result = await response.json();
-      if (result.predictions?.[0]?.bytesBase64Encoded) {
-        setJournalImage(`data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`);
-        setImageUrl(`data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`);
-      } else {
-        setJournalImage(null);
-        setImageUrl("https://placehold.co/600x400/orange/white?text=Your+Story+Illustration");
-      }
-    } catch (error) {
-      console.error("Banana Image Error:", error);
-    } finally {
-      setIsGeneratingImage(false);
-    }
-  };
+  //     const result = await response.json();
+  //     if (result.predictions?.[0]?.bytesBase64Encoded) {
+  //       setJournalImage(`data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`);
+  //       setImageUrl(`data:image/png;base64,${result.predictions[0].bytesBase64Encoded}`);
+  //     } else {
+  //       setJournalImage(null);
+  //       setImageUrl("https://placehold.co/600x400/orange/white?text=Your+Story+Illustration");
+  //     }
+  //   } catch (error) {
+  //     console.error("Banana Image Error:", error);
+  //   } finally {
+  //     setIsGeneratingImage(false);
+  //   }
+  // };
 
   const speakText = async (text, options = {}) => {
     const { rate = 0.9 } = options;
@@ -856,9 +861,9 @@ General rules:
         id: user.uid,                            
         timestamp: serverTimestamp(),              
         journal: withUpload ? capturedImage : null, 
-        keyIdea: journalImage,                 
+        // keyIdea: journalImage,
         keyIdeaText: generatedJournal,
-        illustration: imageUrl,                   
+        // illustration: imageUrl,
         rawAnswers: answers,
         grade: grade
       });
@@ -876,7 +881,7 @@ General rules:
           </div>
           <div>
             <p className="text-[10px] md:text-xs uppercase tracking-[0.35em] text-orange-700/70 font-bold">Voice Writing Studio</p>
-            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Journal Buddy</h1>
+            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
           </div>
         </div>
         
@@ -973,7 +978,7 @@ General rules:
                       <div className="space-y-2">
                         <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Custom</p>
                         <p className="text-sm leading-6 text-stone-600">
-                          Add a parent note if you want Journal Buddy to emphasize something beyond the grade-level default.
+                          Add a parent note if you want Writing Buddy to emphasize something beyond the grade-level default.
                         </p>
                         {customExpectation.trim() && (
                           <p className="text-sm leading-6 text-stone-900 font-semibold">
@@ -1019,7 +1024,7 @@ General rules:
                       A softer start for little storytellers.
                     </h2>
                     <p className="max-w-xl text-lg md:text-xl leading-relaxed text-stone-600 font-medium">
-                      Journal Buddy listens first, guides one question at a time, and turns everyday moments into a story kids can actually write down.
+                      Writing Buddy listens first, guides one question at a time, and turns everyday moments into a story kids can actually write down.
                     </p>
                   </div>
 
@@ -1213,6 +1218,7 @@ General rules:
                   <button onClick={() => speakText(generatedJournal)} className="absolute top-4 right-4 p-3 bg-white rounded-full shadow-md"><Volume2 className="text-orange-500 w-6 h-6" /></button>
                   <p className="text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
                 </div>
+                {/* Illustration preview intentionally disabled for now.
                 <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-8 border-white bg-gray-50 min-h-[300px] flex items-center justify-center">
                   {isGeneratingImage ? (
                     <div className="flex flex-col items-center gap-4 text-gray-400 font-bold">
@@ -1223,11 +1229,11 @@ General rules:
                     <img src={imageUrl} alt="Journal Illustration" className="w-full h-auto object-cover" />
                   ) : (
                     <div className="flex flex-col items-center text-gray-300">
-                      <ImageIcon size={100} strokeWidth={1} />
                       <span className="font-bold">No illustration available</span>
                     </div>
                   )}
                 </div>
+                */}
                 <div className="flex gap-4">
                   <button onClick={() => setStep('idle')} className="flex-1 py-5 bg-gray-100 rounded-2xl font-black text-gray-500">Restart</button>
                   <button onClick={() => setView('journaling')} className="flex-1 py-5 bg-green-500 text-white rounded-2xl font-black text-xl shadow-lg flex items-center justify-center gap-2">Start Writing <ChevronRight /></button>
@@ -1270,13 +1276,14 @@ General rules:
                 </p>
             </div>
 
-            {/* Illustration Area - Instead of Type Area */}
+            {/* Illustration area intentionally disabled for now.
             <div className="flex-1 rounded-[2.5rem] overflow-hidden border-8 border-white shadow-lg bg-gray-50 flex items-center justify-center relative min-h-[280px]">
                 <img src={imageUrl} alt="Journal Illustration" className="w-full h-full object-cover" />
                 <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-sm px-4 py-1 rounded-full text-xs font-bold text-gray-500">
                     Drawing Idea
                 </div>
             </div>
+            */}
 
             {/* Bottom Actions */}
             <div className="space-y-4 flex-shrink-0">
@@ -1366,7 +1373,7 @@ General rules:
               <div className="space-y-6">
                 <div className="space-y-3">
                   <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Custom expectation</p>
-                  <h3 className="text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Journal Buddy what to prioritize.</h3>
+                  <h3 className="text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Writing Buddy what to prioritize.</h3>
                   <p className="text-base leading-7 text-stone-600">
                     Example: use shorter sentences, encourage more descriptive words, keep the tone gentle, or focus on confidence with punctuation.
                   </p>
