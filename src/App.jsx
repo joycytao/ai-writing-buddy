@@ -40,6 +40,52 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 
 const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const guidedFlow = ['story', 'who', 'what', 'when', 'where', 'why', 'how'];
+const fiveWSteps = ['who', 'what', 'when', 'where', 'why', 'how'];
+const geminiLiveModel = 'gemini-3.1-flash-live-preview';
+const geminiLiveFunctionName = 'capture_story_step';
+const geminiLiveFunctionDeclaration = {
+  name: geminiLiveFunctionName,
+  description: 'Returns the next structured action for the child journaling flow.',
+  parameters: {
+    type: 'object',
+    properties: {
+      requestId: {
+        type: 'string',
+        description: 'Echo the latest client requestId exactly.',
+      },
+      nextStep: {
+        type: 'string',
+        enum: ['story', 'who', 'what', 'when', 'where', 'why', 'how', 'generating'],
+        description: 'The next step the app should move to.',
+      },
+      question: {
+        type: 'string',
+        description: 'The short child-friendly prompt the app should speak next.',
+      },
+      shouldConfirm: {
+        type: 'boolean',
+        description: 'Whether the app should confirm the answer before advancing.',
+      },
+      capturedAnswer: {
+        type: 'string',
+        description: 'The cleaned answer captured from the child. Use an empty string when nothing new was captured.',
+      },
+    },
+    required: ['requestId', 'nextStep', 'question', 'shouldConfirm', 'capturedAnswer'],
+  },
+};
+const geminiLiveSystemInstruction = `You are the dialogue planner for a child journaling app.
+Always respond by calling the function ${geminiLiveFunctionName}. Never reply with plain text.
+
+Rules:
+- Keep prompts warm, brief, and age-appropriate.
+- Stay faithful to the child's words. Light cleanup is allowed, but do not invent facts.
+- Use previous answers to make follow-up questions more specific.
+- For answer capture, ask a concise confirmation question.
+- For step advancement, ask only one next question.
+- If the next step is generating, set question to an empty string.
+- Always echo the requestId exactly.`;
 
 
   const App = () => {
@@ -68,14 +114,31 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
   const [isSaving, setIsSaving] = useState(false);
   const [isGeneratingImage, setIsGeneratingImage] = useState(false);
   const [journalImage, setJournalImage] = useState(null);
+  const [liveStatus, setLiveStatus] = useState(() => {
+    if (!isLocal) return 'hidden';
+    if (isMockMode) return 'mock';
+    return googleAIKey ? 'idle' : 'fallback';
+  });
+  const [liveUsage, setLiveUsage] = useState(null);
+  const [liveErrorDetail, setLiveErrorDetail] = useState('');
+  const [lastTranscript, setLastTranscript] = useState('');
+  const [lastRecognitionState, setLastRecognitionState] = useState('Idle');
+  const [liveRawPreview, setLiveRawPreview] = useState('');
 
   const recognitionRef = useRef(null);
   const customRecognitionRef = useRef(null);
   const silenceTimerRef = useRef(null);
   const mockActionTimerRef = useRef(null);
+  const mockResumeTimerRef = useRef(null);
   const audioRef = useRef(null);
   const canvasRef = useRef(null);
   const hasAutoTriggeredSpellMockRef = useRef(false);
+  const hasPausedAtStoryMockRef = useRef(false);
+  const liveSocketRef = useRef(null);
+  const liveSetupPromiseRef = useRef(null);
+  const livePendingGuidanceRef = useRef(null);
+  const liveRequestCounterRef = useRef(0);
+  const [liveLastEvent, setLiveLastEvent] = useState('Idle');
 
 
   /// Firebase Authentication
@@ -107,12 +170,20 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 
       recognitionRef.current.onresult = (event) => {
         const transcript = event.results[0][0].transcript.toLowerCase();
-        handleVoiceInput(transcript);
+        setLastTranscript(transcript);
+        setLastRecognitionState('Transcript received.');
+        void handleVoiceInput(transcript);
         stopListening();
       };
 
-      recognitionRef.current.onerror = () => setIsListening(false);
-      recognitionRef.current.onend = () => setIsListening(false);
+      recognitionRef.current.onerror = (event) => {
+        setLastRecognitionState(`Recognition error: ${event.error || 'unknown'}`);
+        setIsListening(false);
+      };
+      recognitionRef.current.onend = () => {
+        setLastRecognitionState('Recognition ended.');
+        setIsListening(false);
+      };
     }
   }, [step, isConfirming, answers, view]);
 
@@ -148,6 +219,21 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
   }, []);
 
   useEffect(() => {
+    if (!isLocal) return;
+
+    if (isMockMode) {
+      setLiveStatus('mock');
+      setLiveErrorDetail('');
+      setLiveLastEvent('Mock mode enabled. Gemini Live is bypassed.');
+      return;
+    }
+
+    setLiveStatus(googleAIKey ? 'idle' : 'fallback');
+    if (googleAIKey) setLiveErrorDetail('');
+    setLiveLastEvent(googleAIKey ? 'Waiting to open Gemini Live.' : 'No Gemini API key found.');
+  }, [isMockMode]);
+
+  useEffect(() => {
     if (isListening) {
       silenceTimerRef.current = setTimeout(() => {
         if (isListening) {
@@ -159,7 +245,7 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
     if (isMockMode && view !== 'journaling') {
       mockActionTimerRef.current = setTimeout(() => {
         triggerMockInput();
-      }, 500);
+      }, step === 'story' ? 1800 : 500);
     }
     } else {
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
@@ -185,30 +271,55 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
     }
   }, [view, isMockMode]);
 
+  useEffect(() => {
+    if (!isMockMode || step !== 'story') {
+      hasPausedAtStoryMockRef.current = false;
+      if (mockResumeTimerRef.current) {
+        clearTimeout(mockResumeTimerRef.current);
+        mockResumeTimerRef.current = null;
+      }
+    }
+  }, [isMockMode, step]);
+
   const startListening = () => {
     if (isSpeaking) return;
+
+    if (mockResumeTimerRef.current) {
+      clearTimeout(mockResumeTimerRef.current);
+      mockResumeTimerRef.current = null;
+    }
+
+    if (isMockMode && view !== 'journaling') {
+      setLastRecognitionState('Mock listening started.');
+      setIsListening(true);
+      return;
+    }
+
     try {
+      setLastRecognitionState('Starting browser speech recognition.');
       recognitionRef.current?.start();
       setIsListening(true);
     } catch (e) {
       // avoid redundant errors if start is called multiple times
+      setLastRecognitionState('Could not start browser speech recognition.');
       setIsListening(false);
     }
   };
 
   const stopListening = () => {
+    setLastRecognitionState('Stopped listening.');
+    setIsListening(false);
+
     try {
       recognitionRef.current?.stop();
-    } catch (e) {
-      setIsListening(false);
-    }
+    } catch (e) {}
   };
 
   const handleSpellAssistPress = () => {
     if (isMockMode && view === 'journaling') {
       setIsListening(true);
       mockActionTimerRef.current = setTimeout(() => {
-        handleVoiceInput('how to spell elephant');
+        void handleVoiceInput('how to spell elephant');
         stopListening();
       }, 500);
       return;
@@ -218,9 +329,421 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
   };
 
   // ---  handle voice input logic ---
-  const handleVoiceInput = (text) => {
+  const isWritingIntent = (text) => {
+    const normalized = text.toLowerCase().trim();
+    const triggerPhrases = [
+      'i want to start writing',
+      'start writing',
+      'start journal',
+      'start journaling',
+      'start my writing',
+      "let's start writing",
+      'lets start writing',
+      'i want to write my journal',
+      'write my journal',
+      'start my journal',
+      'i want to write',
+      'help me write',
+      'let me write',
+      'i am ready to write',
+      "i'm ready to write",
+      'writing time',
+      'start my story',
+      'tell my story'
+    ];
 
-    if (step === 'idle' && (text.includes('journal') || text.includes('write'))) {
+    if (triggerPhrases.some((phrase) => normalized.includes(phrase))) {
+      return true;
+    }
+
+    const hasWritingVerb = /(start|write|begin|make|create|tell)/.test(normalized);
+    const hasWritingTarget = /(journal|story|writing)/.test(normalized);
+    return hasWritingVerb && hasWritingTarget;
+  };
+
+  const getSpellRequestWord = (text = '') => {
+    const normalized = text.toLowerCase().trim();
+    const spellMatch = normalized.match(/how (?:do i )?spell(?: the word)?\s+(.+)/i);
+    return spellMatch?.[1]?.trim() || '';
+  };
+
+  const isSpellRequest = (text = '') => Boolean(getSpellRequestWord(text));
+
+  const normalizeCapturedAnswer = (text = '') => text.trim().replace(/\s+/g, ' ');
+
+  const delay = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const getNextFlowStep = (currentStep) => {
+    const flow = [...guidedFlow, 'generating'];
+    const currentIndex = flow.indexOf(currentStep);
+    return flow[currentIndex + 1] || 'generating';
+  };
+
+  const sanitizeGuidance = (guidance, fallback) => {
+    if (!guidance || typeof guidance !== 'object') return fallback;
+
+    return {
+      requestId: guidance.requestId || fallback.requestId,
+      nextStep: [...guidedFlow, 'generating'].includes(guidance.nextStep) ? guidance.nextStep : fallback.nextStep,
+      question: typeof guidance.question === 'string' && guidance.question.trim() ? guidance.question.trim() : fallback.question,
+      shouldConfirm: typeof guidance.shouldConfirm === 'boolean' ? guidance.shouldConfirm : fallback.shouldConfirm,
+      capturedAnswer: typeof guidance.capturedAnswer === 'string'
+        ? normalizeCapturedAnswer(guidance.capturedAnswer)
+        : fallback.capturedAnswer,
+    };
+  };
+
+  const buildFallbackGuidance = ({ mode, currentStep, transcript = '', currentAnswers = {}, requestId }) => {
+    const cleanedTranscript = normalizeCapturedAnswer(transcript);
+
+    if (mode === 'story_capture') {
+      return {
+        requestId,
+        nextStep: 'who',
+        question: `Thanks for sharing. ${getStepQuestion('who', { ...currentAnswers, story: cleanedTranscript })}`,
+        shouldConfirm: false,
+        capturedAnswer: cleanedTranscript,
+      };
+    }
+
+    if (mode === 'answer_capture') {
+      return {
+        requestId,
+        nextStep: currentStep,
+        question: `${getConfirmationQuestion(currentStep, cleanedTranscript)} Is this correct?`,
+        shouldConfirm: true,
+        capturedAnswer: cleanedTranscript,
+      };
+    }
+
+    const nextStep = getNextFlowStep(currentStep);
+    return {
+      requestId,
+      nextStep,
+      question: nextStep === 'generating' ? '' : `Great! Next, ${getStepQuestion(nextStep, currentAnswers)}`,
+      shouldConfirm: false,
+      capturedAnswer: '',
+    };
+  };
+
+  const buildLiveGuidancePrompt = ({ requestId, mode, currentStep, transcript = '', currentAnswers = {} }) => `
+Plan the next app action for a child voice journaling session.
+
+Return the result only through the ${geminiLiveFunctionName} function.
+
+Session input:
+${JSON.stringify({
+  requestId,
+  mode,
+  currentStep,
+  grade,
+  transcript,
+  answers: currentAnswers,
+}, null, 2)}
+
+Instructions:
+- If mode is "story_capture", store the story in capturedAnswer, move to nextStep "who", and ask a specific who-question based on the story.
+- If mode is "answer_capture", keep nextStep as the current step, set shouldConfirm to true, capture a lightly cleaned answer, and ask a short confirmation question.
+- If mode is "advance", move to the next step in the flow story -> who -> what -> when -> where -> why -> how -> generating.
+- For advance mode, ask one context-aware question for the next step using previous answers.
+- If nextStep is "generating", set question to an empty string.
+- Keep the tone encouraging and concise.
+- Do not add facts that the child did not say.
+`;
+
+  const closeGeminiLiveSession = (reason = 'Closing Gemini Live session') => {
+    if (livePendingGuidanceRef.current) {
+      window.clearTimeout(livePendingGuidanceRef.current.timeoutId);
+      livePendingGuidanceRef.current.reject(new Error(reason));
+      livePendingGuidanceRef.current = null;
+    }
+
+    if (liveSocketRef.current) {
+      try {
+        liveSocketRef.current.close(1000, reason);
+      } catch (error) {
+        console.error('Gemini Live close error:', error);
+      }
+    }
+
+    liveSocketRef.current = null;
+    liveSetupPromiseRef.current = null;
+    if (isLocal && !isMockMode) {
+      setLiveErrorDetail(reason);
+      setLiveLastEvent(reason);
+      setLiveStatus(googleAIKey ? 'fallback' : 'fallback');
+    }
+  };
+
+  const ensureGeminiLiveSession = async () => {
+    if (liveSocketRef.current?.readyState === WebSocket.OPEN) {
+      if (isLocal && !isMockMode) setLiveStatus('connected');
+      return liveSocketRef.current;
+    }
+
+    if (liveSetupPromiseRef.current) {
+      return liveSetupPromiseRef.current;
+    }
+
+    liveSetupPromiseRef.current = new Promise((resolve, reject) => {
+      let setupResolved = false;
+      const socket = new WebSocket(
+        `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${googleAIKey}`
+      );
+      socket.binaryType = 'arraybuffer';
+
+      liveSocketRef.current = socket;
+      if (isLocal && !isMockMode) {
+        setLiveStatus('connecting');
+        setLiveLastEvent('Opening Gemini Live WebSocket.');
+      }
+
+      socket.onopen = () => {
+        if (isLocal && !isMockMode) setLiveLastEvent('WebSocket opened. Sending setup.');
+        socket.send(JSON.stringify({
+          setup: {
+            model: `models/${geminiLiveModel}`,
+            generationConfig: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: {
+                    voiceName: 'Puck',
+                  },
+                },
+              },
+            },
+            systemInstruction: { parts: [{ text: geminiLiveSystemInstruction }] },
+            tools: [{ functionDeclarations: [geminiLiveFunctionDeclaration] }],
+          },
+        }));
+      };
+
+      socket.onmessage = async (event) => {
+        try {
+          let rawMessage = '';
+
+          if (typeof event.data === 'string') {
+            rawMessage = event.data;
+          } else if (event.data instanceof ArrayBuffer) {
+            rawMessage = new TextDecoder().decode(event.data);
+          } else if (typeof Blob !== 'undefined' && event.data instanceof Blob) {
+            rawMessage = await event.data.text();
+          } else {
+            rawMessage = String(event.data ?? '');
+          }
+
+          if (isLocal && !isMockMode) {
+            setLiveRawPreview(rawMessage.slice(0, 400) || 'Empty message');
+          }
+
+          const message = JSON.parse(rawMessage);
+
+          if (isLocal && !isMockMode) {
+            if (message.setupComplete) {
+              setLiveLastEvent('Received setupComplete.');
+            } else if (message.toolCall?.functionCalls?.length) {
+              setLiveLastEvent(`Received tool call: ${message.toolCall.functionCalls[0].name}.`);
+            } else if (message.usageMetadata) {
+              setLiveLastEvent('Received usage metadata.');
+            } else if (message.serverContent) {
+              setLiveLastEvent('Received server content.');
+            } else if (message.error) {
+              setLiveLastEvent(`Server error: ${message.error.message || 'Unknown error'}`);
+            }
+          }
+
+          if (message.usageMetadata) {
+            setLiveUsage(message.usageMetadata);
+          }
+
+          if (message.error) {
+            const errorMessage = message.error.message || 'Gemini Live returned an error.';
+            if (isLocal && !isMockMode) {
+              setLiveErrorDetail(errorMessage);
+            }
+            reject(new Error(errorMessage));
+            return;
+          }
+
+          if (message.setupComplete && !setupResolved) {
+            setupResolved = true;
+            liveSetupPromiseRef.current = null;
+            if (isLocal && !isMockMode) {
+              setLiveErrorDetail('');
+              setLiveStatus('connected');
+            }
+            resolve(socket);
+            return;
+          }
+
+          const functionCalls = message.toolCall?.functionCalls || [];
+
+          functionCalls.forEach((functionCall) => {
+            if (functionCall.name !== geminiLiveFunctionName) return;
+
+            const args = typeof functionCall.args === 'string'
+              ? JSON.parse(functionCall.args)
+              : functionCall.args || {};
+
+            if (isLocal && !isMockMode) {
+              setLiveLastEvent(`Sending tool response for ${functionCall.name}.`);
+            }
+
+            socket.send(JSON.stringify({
+              toolResponse: {
+                functionResponses: [{
+                  id: functionCall.id,
+                  name: functionCall.name,
+                  response: {
+                    status: 'ok',
+                    requestId: args.requestId || '',
+                  },
+                }],
+              },
+            }));
+
+            if (!livePendingGuidanceRef.current) return;
+            if (args.requestId !== livePendingGuidanceRef.current.requestId) return;
+
+            window.clearTimeout(livePendingGuidanceRef.current.timeoutId);
+            livePendingGuidanceRef.current.resolve(args);
+            livePendingGuidanceRef.current = null;
+          });
+        } catch (error) {
+          console.error('Gemini Live message parse error:', error);
+          if (isLocal && !isMockMode) {
+            setLiveErrorDetail(`Could not parse a Gemini Live message.${liveRawPreview ? ' See raw preview.' : ''}`);
+            setLiveLastEvent('Failed to parse Gemini Live message.');
+          }
+        }
+      };
+
+      socket.onerror = () => {
+        liveSetupPromiseRef.current = null;
+        if (isLocal && !isMockMode) {
+          setLiveErrorDetail('WebSocket error while talking to Gemini Live.');
+          setLiveLastEvent('WebSocket onerror fired.');
+          setLiveStatus('fallback');
+        }
+        reject(new Error('Gemini Live connection failed'));
+      };
+
+      socket.onclose = (event) => {
+        liveSocketRef.current = null;
+        liveSetupPromiseRef.current = null;
+        if (isLocal && !isMockMode) {
+          const detail = event.code === 1000
+            ? 'Gemini Live session closed.'
+            : `Gemini Live closed (${event.code}${event.reason ? `: ${event.reason}` : ''}).`;
+          setLiveErrorDetail(detail);
+          setLiveLastEvent(detail);
+          setLiveStatus('fallback');
+        }
+
+        if (livePendingGuidanceRef.current) {
+          window.clearTimeout(livePendingGuidanceRef.current.timeoutId);
+          livePendingGuidanceRef.current.reject(new Error('Gemini Live session closed'));
+          livePendingGuidanceRef.current = null;
+        }
+      };
+    });
+
+    return liveSetupPromiseRef.current;
+  };
+
+  const requestGuidedStep = async ({ mode, currentStep, transcript = '', currentAnswers = {} }) => {
+    const requestId = `guidance_${Date.now()}_${liveRequestCounterRef.current += 1}`;
+    const fallback = buildFallbackGuidance({
+      mode,
+      currentStep,
+      transcript,
+      currentAnswers,
+      requestId,
+    });
+
+    if (isMockMode || !googleAIKey || typeof window === 'undefined' || typeof window.WebSocket === 'undefined') {
+      if (isLocal) setLiveStatus(isMockMode ? 'mock' : 'fallback');
+      return fallback;
+    }
+
+    try {
+      const socket = await ensureGeminiLiveSession();
+
+      if (livePendingGuidanceRef.current) {
+        window.clearTimeout(livePendingGuidanceRef.current.timeoutId);
+        livePendingGuidanceRef.current.reject(new Error('Superseded by a newer guidance request'));
+        livePendingGuidanceRef.current = null;
+      }
+
+      const guidance = await new Promise((resolve, reject) => {
+        const timeoutId = window.setTimeout(() => {
+          if (livePendingGuidanceRef.current?.requestId === requestId) {
+            livePendingGuidanceRef.current = null;
+          }
+          reject(new Error('Gemini Live guidance timed out'));
+        }, 9000);
+
+        livePendingGuidanceRef.current = { requestId, resolve, reject, timeoutId };
+
+        if (isLocal && !isMockMode) {
+          setLiveLastEvent(`Sending ${mode} request for ${currentStep}.`);
+        }
+
+        socket.send(JSON.stringify({
+          realtimeInput: {
+            text: buildLiveGuidancePrompt({
+              requestId,
+              mode,
+              currentStep,
+              transcript,
+              currentAnswers,
+            }),
+          },
+        }));
+      });
+
+      return sanitizeGuidance(guidance, fallback);
+    } catch (error) {
+      console.error('Gemini Live guidance failed:', error);
+      if (isLocal && !isMockMode) {
+        setLiveErrorDetail(error.message || 'Gemini Live guidance failed.');
+      }
+      closeGeminiLiveSession('Reset after Gemini Live guidance failure');
+      return fallback;
+    }
+  };
+
+  useEffect(() => () => {
+    if (livePendingGuidanceRef.current) {
+      window.clearTimeout(livePendingGuidanceRef.current.timeoutId);
+      livePendingGuidanceRef.current = null;
+    }
+
+    if (mockResumeTimerRef.current) {
+      window.clearTimeout(mockResumeTimerRef.current);
+      mockResumeTimerRef.current = null;
+    }
+
+    if (liveSocketRef.current) {
+      try {
+        liveSocketRef.current.close(1000, 'Component unmounted');
+      } catch (error) {
+        console.error('Gemini Live cleanup error:', error);
+      }
+    }
+  }, []);
+
+  const handleVoiceInput = async (text) => {
+    if (view === 'journaling' && isSpellRequest(text)) {
+      const word = getSpellRequestWord(text);
+      if (word) {
+        handleSpellCheck(word);
+      }
+      return;
+    }
+
+    if (step === 'idle' && isWritingIntent(text)) {
       startGuidedProcess();
       return;
     }
@@ -230,20 +753,18 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
       return;
     }
 
-    setUserInput(text);
+    if (step === 'story') {
+      await processStoryIntro(text);
+      return;
+    }
 
     // 5W1H 核心引導流程
-    if (['who', 'what', 'when', 'where', 'why', 'how'].includes(step)) {
+    if (fiveWSteps.includes(step)) {
       if (isConfirming) {
-        handleConfirmation(text);
+        await handleConfirmation(text);
       } else {
-        processInitialAnswer(text);
+        await processInitialAnswer(text);
       }
-    }
-    // Spell check trigger
-    if (view === 'journaling' && text.includes('how to spell')) {
-      const word = text.split('how to spell').pop().trim();
-      if (word) handleSpellCheck(word);
     }
   };
 
@@ -251,22 +772,60 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
   const startGuidedProcess = () => {
     setAnswers({});
     setUserInput(''); 
-    setStep('who');
+    setLastTranscript('');
+    setLastRecognitionState('Starting guided session.');
+    setStep('story');
     setIsConfirming(false);
-    // setJournalImage(null);
-    speakAndListen("Awesome! Let's write. First, Who were you with today?");
+    hasPausedAtStoryMockRef.current = false;
+    speakAndListen("Awesome! Tell me about your story.");
+  };
+
+  const processStoryIntro = async (text) => {
+    const storyText = normalizeCapturedAnswer(text);
+    if (!storyText) return;
+
+    const guidance = await requestGuidedStep({
+      mode: 'story_capture',
+      currentStep: 'story',
+      transcript: storyText,
+      currentAnswers: answers,
+    });
+
+    const capturedStory = storyText;
+    const nextStep = guidance.nextStep || 'who';
+    const nextAnswers = { ...answers, story: capturedStory };
+
+    setAnswers(nextAnswers);
+    setUserInput(capturedStory);
+    setStep(nextStep);
+    setIsConfirming(Boolean(guidance.shouldConfirm));
+    speakAndListen(guidance.question || `Thanks for sharing. ${getStepQuestion(nextStep, nextAnswers)}`);
   };
 
   // step 1: handle initial answer and ask for confirmation
-  const processInitialAnswer = (text) => {
-    setAnswers(prev => ({ ...prev, [step]: text }));
-    setIsConfirming(true);
-    const question = getConfirmationQuestion(step, text);
-    speakAndListen(`${question} Is this correct?`);
+  const processInitialAnswer = async (text) => {
+    const currentStep = step;
+    const cleanedText = normalizeCapturedAnswer(text);
+    if (!cleanedText) return;
+
+    const guidance = await requestGuidedStep({
+      mode: 'answer_capture',
+      currentStep,
+      transcript: cleanedText,
+      currentAnswers: answers,
+    });
+
+    const capturedAnswer = cleanedText;
+    setAnswers(prev => ({ ...prev, [currentStep]: capturedAnswer }));
+    setUserInput(capturedAnswer);
+    setIsConfirming(guidance.shouldConfirm ?? true);
+
+    const confirmationQuestion = `${getConfirmationQuestion(currentStep, capturedAnswer)} Is this correct?`;
+    speakAndListen(confirmationQuestion);
   };
 
   // Step 2：comfirm with user if the answer is correct, if not, let them answer again
-  const handleConfirmation = (text) => {
+  const handleConfirmation = async (text) => {
     const positiveWords = ['yes', 'yeah', 'yep', 'correct', 'right', 'it is', 'sure'];
     const negativeWords = ['no', 'nope', 'not', 'wrong', 'change', 'incorrect', 'wait'];
 
@@ -275,29 +834,33 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 
     if (isYes) {
       // move to next question
-      moveToNextStep();
+      await moveToNextStep();
     } else if (isNo) {
       // back to current question and let user answer again
       setIsConfirming(false);
       setUserInput('');
-      const question = getStepQuestion(step);
+      const question = getStepQuestion(step, answers);
       speakAndListen(`No problem! Let's try again. ${question}`);
     } else {
        if (text.length > 3 && !isYes && !isNo) { 
-        processInitialAnswer(text);
+        await processInitialAnswer(text);
+        return;
       }
       speakAndListen(`I didn't quite catch that. Is "${answers[step]}" correct? Please say Yes or No.`);
     }
   };
 
-  const getStepQuestion = (s) => {
+  const getStepQuestion = (s, context = {}) => {
+    const whoLabel = context.who ? `${context.who}` : 'them';
+    const whatLabel = context.what ? `${context.what}` : 'that';
     const questions = {
+      story: "Tell me about your story.",
       who: "Who were you with today?",
-      what: "What did you do?",
-      when: "When did this happen?",
-      where: "Where were you?",
-      why: "Why was it special?",
-      how: "How did you feel about it?"
+      what: context.who ? `What did you do with ${whoLabel}?` : "What did you do?",
+      when: context.what ? `When did ${whatLabel} happen?` : "When did this happen?",
+      where: context.what ? `Where did ${whatLabel} happen?` : "Where were you?",
+      why: context.what ? `Why was ${whatLabel} special?` : "Why was it special?",
+      how: context.what ? `How did you feel when ${whatLabel} happened?` : "How did you feel about it?"
     };
     return questions[s] || "";
   };
@@ -308,7 +871,9 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
       what: `You said you did ${answer}.`,
       when: `You said it happened ${answer}.`,
       where: `You mentioned you were at ${answer}.`,
-      why: `You said it was special because ${answer}.`,
+      why: answer.toLowerCase().startsWith('because ')
+        ? `You said ${answer}.`
+        : `You said it was special because ${answer}.`,
       how: `You said you felt ${answer}.`
     };
     return `${questions[s] || `You said: ${answer}.`}`;
@@ -316,9 +881,21 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 
   const triggerMockInput = () => {
     if (step === 'idle') {
-      handleVoiceInput("i want to write my journal");
+      void handleVoiceInput("i want to start writing");
+    } else if (step === 'story') {
+      if (!hasPausedAtStoryMockRef.current) {
+        hasPausedAtStoryMockRef.current = true;
+        stopListening();
+        mockResumeTimerRef.current = setTimeout(() => {
+          startListening();
+          mockResumeTimerRef.current = null;
+        }, 1200);
+        return;
+      }
+
+      void handleVoiceInput("I went to the zoo with my brother and saw a huge elephant");
     } else if (isConfirming) {
-      handleVoiceInput("yes");
+      void handleVoiceInput("yes");
     } else {
       const mocks = {
         who: "my big brother",
@@ -328,15 +905,19 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
         why: "we saw a huge elephant",
         how: "so excited"
       };
-      handleVoiceInput(mocks[step] || "it was fun");
+      void handleVoiceInput(mocks[step] || "it was fun");
     }
     stopListening();
   };
 
-  const moveToNextStep = () => {
-    const flow = ['who', 'what', 'when', 'where', 'why', 'how', 'generating'];
-    const currentIndex = flow.indexOf(step);
-    const nextStep = flow[currentIndex + 1];
+  const moveToNextStep = async () => {
+    const guidance = await requestGuidedStep({
+      mode: 'advance',
+      currentStep: step,
+      currentAnswers: answers,
+    });
+
+    const nextStep = guidance.nextStep || getNextFlowStep(step);
     
     setStep(nextStep);
     setIsConfirming(false);
@@ -345,12 +926,12 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
     if (nextStep === 'generating') {
       generateJournalContent(answers);
     } else {
-      speakAndListen(`Great! Next, ${getStepQuestion(nextStep)}`);
+      speakAndListen(guidance.question || `Great! Next, ${getStepQuestion(nextStep, answers)}`);
     }
   };
 
   const moveToPrevStep = () => {
-    const flow = ['who', 'what', 'when', 'where', 'why', 'how'];
+    const flow = guidedFlow;
     const currentIndex = flow.indexOf(step);
     if (currentIndex > 0) {
       const prevStep = flow[currentIndex - 1];
@@ -358,10 +939,9 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
       setStep(prevStep);
       setIsConfirming(false);
       setUserInput(previousAnswer);
-      const confirmationText = previousAnswer ? ` ${getConfirmationQuestion(prevStep, previousAnswer)}` : '';
-      speakAndListen(`Let's go back. ${getStepQuestion(prevStep)}${confirmationText}`);
-    } else if (step === 'who') {
-      // to prevent user from going back before 'who' step by voice command, we can reset the whole flow
+      const confirmationText = prevStep !== 'story' && previousAnswer ? ` ${getConfirmationQuestion(prevStep, previousAnswer)}` : '';
+      speakAndListen(`Let's go back. ${getStepQuestion(prevStep, answers)}${confirmationText}`);
+    } else if (step === 'story') {
       setStep('idle');
       setAnswers({});
       speakText("Going back to home.");
@@ -372,6 +952,7 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
    const speakAndListen = async (text) => {
 
     stopListening();
+    setLastRecognitionState('Speaking prompt.');
     await speakText(text);
     setTimeout(() => startListening(), 300);
 
@@ -417,6 +998,47 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
     return `Today I was with ${who}. We ${what} ${where} ${when}. It was special because ${why}. I felt ${how}.`;
   };
 
+  const fetchGeminiWithRetry = async (url, options) => {
+    const retryDelays = [2000, 4000, 8000];
+
+    for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+      try {
+        const response = await fetch(url, options);
+
+        if (response.ok) {
+          return response;
+        }
+
+        const errorText = await response.text();
+        const isRetryable = response.status === 503;
+
+        if (!isRetryable || attempt === retryDelays.length) {
+          const finalError = new Error(`Gemini request failed with ${response.status} ${response.statusText}${errorText ? `: ${errorText}` : ''}`);
+          finalError.retryable = false;
+          throw finalError;
+        }
+
+        console.warn(`Gemini request failed with ${response.status}. Retrying in ${retryDelays[attempt] / 1000}s.`);
+        await delay(retryDelays[attempt]);
+      } catch (error) {
+        const isLastAttempt = attempt === retryDelays.length;
+
+        if (error?.retryable === false) {
+          throw error;
+        }
+
+        if (isLastAttempt) {
+          throw error;
+        }
+
+        console.warn(`Gemini request error. Retrying in ${retryDelays[attempt] / 1000}s.`, error);
+        await delay(retryDelays[attempt]);
+      }
+    }
+
+    throw new Error('Gemini request failed after retries.');
+  };
+
   const getGradePromptGuidance = (selectedGrade) => {
     const gradeGuidance = {
       Kindergarten: `Kindergarten writing goals:
@@ -428,20 +1050,17 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 - Write 3-4 connected complete sentences.
 - Use capitalization and ending punctuation consistently.
 - Stay on one clear topic with gentle adult-supported structure.
-- Prefer common sight words and decodable words.
-- Make every sentence short and easy enough for a child to shadow write by copying line by line.`,
+- Prefer common sight words and decodable words.`,
       'Grade 2': `2nd grade writing goals:
 - Write several sentences about one topic.
 - Use clear basic sentence structure.
 - Include simple temporal words such as "First," "Then," or "Next" when they fit.
-- Keep the writing easy to revise for clarity with guidance.
-- Keep sentence length manageable so a child can shadow write it with support.`,
+- Keep the writing easy to revise for clarity with guidance.`,
       'Grade 3': `3rd grade writing goals:
 - Write one organized paragraph with a topic sentence and relevant details.
 - Use linking words, capitalization, and punctuation consistently.
 - Add light description and natural story detail.
-- Keep the structure appropriate for a short narrative paragraph.
-- Keep the paragraph simple enough for a child to shadow write without overwhelming sentence length.`,
+- Keep the structure appropriate for a short narrative paragraph.`,
       'Grade 4': `4th grade writing goals:
 - Write a more structured multi-paragraph response.
 - Give a gentle introduction, supporting middle, and short conclusion.
@@ -528,30 +1147,18 @@ General rules:
 - Keep all 5W1H details included, even if some need simple rewording.
 - Write in age-appropriate English for ${grade}.
 - Make it sound natural, warm, and child-centered.
-- For Grade 1, Grade 2, and Grade 3, make the journal easy for a child to shadow write by hand.
 - Do not add facts that were not given.
+- Ensure writing flow is better, make sure to delete redundant words, for example, "because because".
 - Output only the journal text, with no title, bullets, labels, or explanation.`;
 
     console.log("Sending prompt to Google AI:", prompt);
 
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
       });
-
-
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error("Gemini journal request failed", {
-          status: response.status,
-          statusText: response.statusText,
-          body: errorText,
-        });
-        throw new Error(`Gemini request failed with ${response.status} ${response.statusText}${errorText ? `: ${errorText}` : ''}`);
-      }
 
       const result = await response.json();
       const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "Today was a fun day!";
@@ -757,13 +1364,23 @@ General rules:
     const spelled = letters.join('-');
     const spokenSpelling = letters.join(' ... ');
     setSpellResult(`${word.toUpperCase()}: ${spelled}`);
-    speakText(`${word} is spelled ${spokenSpelling}`, { rate: 0.6 });
+    speakText(`${word} is spelled ${spokenSpelling}`, { rate: 0.5 });
     setTimeout(() => setSpellResult(''), 8000);
   };
 
+  const goToWritingPage = () => {
+    setView('journaling');
+    setSpellResult('');
+    setTimeout(() => startListening(), 300);
+  };
+
   const toggleListening = () => {
-    if (isListening) recognitionRef.current?.stop();
-    else { setIsListening(true); recognitionRef.current?.start(); }
+    if (isListening) {
+      stopListening();
+      return;
+    }
+
+    startListening();
   };
 
 
@@ -831,12 +1448,94 @@ General rules:
     }
   };
 
-  const isGuidedStep = ['who', 'what', 'when', 'where', 'why', 'how'].includes(step);
-  const canGoToPreviousQuestion = isGuidedStep && step !== 'who';
+  const isGuidedStep = guidedFlow.includes(step);
+  const canGoToPreviousQuestion = isGuidedStep && step !== 'story';
   const gradeLevels = ['Kindergarten', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5'];
   const gradeValue = Math.max(0, gradeLevels.indexOf(grade));
   const gradeSliderLabel = gradeValue === 0 ? 'K' : `${gradeValue}`;
   const ageRanges = ['5-6', '6-7', '7-8', '8-9', '9-10', '10-11'];
+
+  const getLiveStatusMeta = () => {
+    if (isMockMode) {
+      return {
+        label: 'Mock fallback',
+        className: 'bg-purple-600 text-white',
+        detail: 'Using local structured mock responses.',
+      };
+    }
+
+    if (!googleAIKey) {
+      return {
+        label: 'Fallback mode',
+        className: 'bg-stone-300 text-stone-700',
+        detail: 'No Gemini key detected.',
+      };
+    }
+
+    if (liveStatus === 'connected') {
+      return {
+        label: 'Live connected',
+        className: 'bg-emerald-500 text-white',
+        detail: liveUsage?.totalTokenCount
+          ? `${liveUsage.totalTokenCount} total tokens used in the latest Live turn.`
+          : 'Gemini Live is connected.',
+      };
+    }
+
+    if (liveStatus === 'connecting') {
+      return {
+        label: 'Live connecting',
+        className: 'bg-amber-500 text-white',
+        detail: 'Opening Gemini Live session.',
+      };
+    }
+
+    if (liveStatus === 'fallback') {
+      return {
+        label: 'Fallback mode',
+        className: 'bg-stone-300 text-stone-700',
+        detail: liveErrorDetail || 'Live setup failed, so local prompts are in use.',
+      };
+    }
+
+    return {
+      label: 'Live ready',
+      className: 'bg-sky-500 text-white',
+      detail: 'Gemini Live will connect on the next guided turn.',
+    };
+  };
+
+  const getFlowSummaryCards = () => {
+    const nextStep = getNextFlowStep(step);
+    return [
+      {
+        label: 'Story',
+        value: answers.story ? 'Captured' : 'Waiting',
+        active: step === 'story',
+      },
+      {
+        label: 'This step',
+        value: isConfirming ? 'Needs yes / no' : 'Listening',
+        active: !isConfirming,
+      },
+      {
+        label: 'Next up',
+        value: nextStep === 'generating' ? 'Write journal' : nextStep,
+        active: isConfirming,
+      },
+    ];
+  };
+
+  const getLocalDebugRows = () => [
+    { label: 'Step', value: step },
+    { label: 'Listening', value: isListening ? 'Yes' : 'No' },
+    { label: 'Mode', value: isMockMode ? 'Mock' : 'Live / fallback' },
+    { label: 'Speech', value: lastRecognitionState },
+    { label: 'Transcript', value: lastTranscript || 'None' },
+    { label: 'Last event', value: liveLastEvent },
+    { label: 'Last error', value: liveErrorDetail || 'None' },
+    { label: 'Raw preview', value: liveRawPreview || 'None' },
+  ];
 
   const goToHomePage = () => {
     setView('home');
@@ -850,6 +1549,16 @@ General rules:
     setSpellResult('');
     stopListening();
   };
+
+  useEffect(() => {
+    if (view !== 'journaling' || isMockMode || isListening || isSpeaking) return;
+
+    const timer = setTimeout(() => {
+      startListening();
+    }, 1200);
+
+    return () => clearTimeout(timer);
+  }, [view, isMockMode, isListening, isSpeaking]);
 
   const uploadPhoto = async (withUpload) => {
     if (!user) return;
@@ -873,22 +1582,28 @@ General rules:
 
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fff8e7_0%,_#f5ebd7_42%,_#eadbc2_100%)] font-sans text-gray-800 p-3 sm:p-4 md:p-6 flex flex-col items-center">
-      <header className="w-full max-w-5xl flex flex-col gap-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:py-4 mb-3 sm:mb-4">
-        <div className="flex min-w-0 items-center gap-2 cursor-pointer self-start" onClick={() => { setView('home'); setStep('idle'); }}>
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fff8e7_0%,_#f5ebd7_42%,_#eadbc2_100%)] font-sans text-gray-800 p-4 md:p-6 flex flex-col items-center">
+      <header className="w-full max-w-5xl flex justify-between items-center py-4 mb-4">
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { setView('home'); setStep('idle'); }}>
           <div className="bg-gradient-to-br from-orange-500 to-amber-500 p-2.5 rounded-2xl shadow-lg shadow-orange-200">
             <BookOpen className="text-white" />
           </div>
-          <div className="min-w-0">
+          <div>
             <p className="text-[10px] md:text-xs uppercase tracking-[0.35em] text-orange-700/70 font-bold">Voice Writing Studio</p>
-            <h1 className="text-xl sm:text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
+            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
           </div>
         </div>
         
-        <div className="flex w-full items-center justify-end gap-3 sm:w-auto">
+        <div className="flex items-center gap-3">
+          {isLocal && (
+            <div className={`inline-flex rounded-full px-3 py-1 text-xs font-bold uppercase tracking-[0.16em] shadow-sm ${getLiveStatusMeta().className}`} title={getLiveStatusMeta().detail}>
+              {getLiveStatusMeta().label}
+            </div>
+          )}
           {isLocal && (
             <button 
               onClick={() => setIsMockMode(!isMockMode)}
+              data-testid="mock-toggle"
               className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold transition-all ${isMockMode ? 'bg-purple-600 text-white' : 'bg-gray-200 text-gray-500'}`}
             >
               <FlaskConical size={14} /> {isMockMode ? "Mock ON" : "Mock OFF"}
@@ -898,7 +1613,7 @@ General rules:
         </div>
       </header>
 
-      <main className="w-full max-w-5xl bg-[linear-gradient(180deg,_rgba(255,253,247,0.96),_rgba(255,247,235,0.94))] rounded-[1.75rem] sm:rounded-[2.25rem] shadow-[0_30px_80px_rgba(120,74,24,0.14)] ring-1 ring-white/80 p-4 sm:p-6 md:p-10 relative overflow-hidden min-h-[560px] sm:min-h-[620px] flex flex-col">
+      <main className="w-full max-w-5xl bg-[linear-gradient(180deg,_rgba(255,253,247,0.96),_rgba(255,247,235,0.94))] rounded-[2.25rem] shadow-[0_30px_80px_rgba(120,74,24,0.14)] ring-1 ring-white/80 p-6 md:p-10 relative overflow-hidden min-h-[620px] flex flex-col">
         <div className="pointer-events-none absolute inset-0">
           <div className="absolute -top-12 right-8 h-40 w-40 rounded-full bg-orange-200/30 blur-3xl" />
           <div className="absolute bottom-0 left-0 h-56 w-56 rounded-full bg-sky-200/25 blur-3xl" />
@@ -908,14 +1623,14 @@ General rules:
         {view === 'setup' && (
           <div className="relative z-10 flex-1 animate-in fade-in zoom-in duration-300">
             <div className="grid gap-8 lg:grid-cols-[0.95fr_1.05fr] h-full">
-              <div className="rounded-[2rem] sm:rounded-[2.5rem] bg-stone-950 text-white p-6 sm:p-8 md:p-10 shadow-[0_30px_60px_rgba(25,25,25,0.18)] flex flex-col justify-between">
+              <div className="rounded-[2.5rem] bg-stone-950 text-white p-8 md:p-10 shadow-[0_30px_60px_rgba(25,25,25,0.18)] flex flex-col justify-between">
                 <div className="space-y-5">
                   <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.28em] text-amber-100/80">
                     <Settings size={14} />
                     Parent settings
                   </div>
                   <div className="space-y-3">
-                    <h2 className="text-3xl sm:text-4xl md:text-5xl font-black tracking-[-0.05em] leading-[0.95]">Tune the app for your child.</h2>
+                    <h2 className="text-4xl md:text-5xl font-black tracking-[-0.05em] leading-[0.95]">Tune the app for your child.</h2>
                     <p className="text-base md:text-lg leading-relaxed text-stone-300">
                       {getCombinedExpectationSummary(grade, customExpectation)}
                     </p>
@@ -929,14 +1644,14 @@ General rules:
                 </div>
               </div>
 
-              <div className="rounded-[2rem] sm:rounded-[2.5rem] border border-white/80 bg-white/75 p-5 sm:p-8 md:p-10 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
+              <div className="rounded-[2.5rem] border border-white/80 bg-white/75 p-8 md:p-10 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
                 <div className="space-y-8">
-                  <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex items-start justify-between gap-4">
                     <div>
                       <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Student grade</p>
-                      <h3 className="mt-3 text-3xl sm:text-4xl font-black tracking-[-0.04em] text-stone-900">{grade}</h3>
+                      <h3 className="mt-3 text-4xl font-black tracking-[-0.04em] text-stone-900">{grade}</h3>
                     </div>
-                    <div className="rounded-[1.5rem] bg-orange-50 px-4 py-3 text-left sm:text-right shadow-sm ring-1 ring-orange-100">
+                    <div className="rounded-[1.5rem] bg-orange-50 px-4 py-3 text-right shadow-sm ring-1 ring-orange-100">
                       <p className="text-[11px] uppercase tracking-[0.24em] text-orange-500 font-black">Recommended</p>
                       <p className="mt-1 text-lg font-black text-orange-900">Ages {ageRanges[gradeValue] || '5-6'}</p>
                     </div>
@@ -1012,7 +1727,7 @@ General rules:
         {view === 'home' && (
           <div className="flex-1 flex flex-col justify-center text-center relative z-10">
             {step === 'idle' && (
-                <div className="animate-in fade-in slide-in-from-top-4 grid gap-8 lg:grid-cols-[1.2fr_0.8fr] items-center text-left">
+              <div className="animate-in fade-in slide-in-from-top-4 grid gap-8 lg:grid-cols-[1.2fr_0.8fr] items-center text-left">
                 <div className="space-y-6">
                   <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-white/75 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.3em] text-orange-700 shadow-sm">
                     <Sparkles size={14} className="text-orange-500" />
@@ -1020,7 +1735,7 @@ General rules:
                   </div>
 
                   <div className="space-y-4">
-                    <h2 className="max-w-2xl text-4xl sm:text-5xl md:text-6xl font-black text-stone-900 leading-[0.92] tracking-[-0.05em]">
+                    <h2 className="max-w-2xl text-5xl md:text-6xl font-black text-stone-900 leading-[0.92] tracking-[-0.05em]">
                       A softer start for little storytellers.
                     </h2>
                     <p className="max-w-xl text-lg md:text-xl leading-relaxed text-stone-600 font-medium">
@@ -1044,6 +1759,7 @@ General rules:
                   <div className="flex flex-col sm:flex-row sm:items-center gap-4 pt-2">
                     <button
                       onClick={toggleListening}
+                      data-testid="home-mic-button"
                       className={`relative inline-flex h-20 w-20 items-center justify-center rounded-full border border-white/60 transition-all duration-300 ${isListening ? 'bg-red-500 scale-105 shadow-[0_18px_40px_rgba(239,68,68,0.3)]' : 'bg-[linear-gradient(135deg,_#1d4ed8,_#0f766e)] shadow-[0_18px_40px_rgba(29,78,216,0.25)] hover:scale-105'} `}
                       aria-label={isListening ? 'Stop listening' : 'Start listening'}
                     >
@@ -1052,12 +1768,12 @@ General rules:
                     </button>
                     <div className="space-y-1">
                       <p className="text-base font-black uppercase tracking-[0.22em] text-stone-900">Tap to begin</p>
-                      <p className="text-stone-600 text-base">Then say, “I want to write my journal.”</p>
+                      <p className="text-stone-600 text-base">Then say, “I want to start writing.”</p>
                     </div>
                   </div>
                 </div>
 
-                  <div className="relative mx-auto w-full max-w-md self-start lg:self-auto">
+                <div className="relative mx-auto w-full max-w-md">
                   <div className="absolute -inset-3 rounded-[2.5rem] bg-[linear-gradient(145deg,_rgba(255,255,255,0.75),_rgba(255,255,255,0.15))] blur-xl" />
                   <div className="relative overflow-hidden rounded-[2.5rem] border border-white/80 bg-stone-950 p-6 text-white shadow-[0_30px_60px_rgba(25,25,25,0.18)]">
                     <div className="flex items-center justify-between">
@@ -1069,6 +1785,26 @@ General rules:
                         {grade}
                       </div>
                     </div>
+
+                    {isLocal && (
+                      <div className={`mt-4 inline-flex rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] ${getLiveStatusMeta().className}`} title={getLiveStatusMeta().detail}>
+                        {getLiveStatusMeta().label}
+                      </div>
+                    )}
+
+                    {isLocal && (
+                      <div className="mt-4 rounded-[1.4rem] border border-white/10 bg-white/10 p-4 text-left backdrop-blur-sm">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-amber-100/70">Local debug</p>
+                        <div className="mt-3 space-y-2 text-xs text-stone-200">
+                          {getLocalDebugRows().map((row) => (
+                            <div key={row.label} className="flex items-start justify-between gap-3">
+                              <span className="shrink-0 font-black uppercase tracking-[0.16em] text-amber-100/70">{row.label}</span>
+                              <span className="text-right text-stone-100">{row.value}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     <div className="mt-6 space-y-3">
                       {[
@@ -1108,14 +1844,14 @@ General rules:
                       Story builder
                     </div>
                     <h2 className="text-4xl md:text-5xl font-black text-stone-900 tracking-[-0.04em] capitalize">{step} matters.</h2>
-                    <p className="text-lg md:text-xl text-stone-600 font-medium leading-relaxed">{getStepQuestion(step)}</p>
+                    <p className="text-lg md:text-xl text-stone-600 font-medium leading-relaxed">{getStepQuestion(step, answers)}</p>
                   </div>
 
-                  <div className="w-full rounded-[2rem] border border-white/80 bg-white/70 px-5 py-4 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm min-w-0 sm:min-w-[220px] sm:w-auto">
+                  <div className="rounded-[2rem] border border-white/80 bg-white/70 px-5 py-4 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm min-w-[220px]">
                     <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Current mode</p>
                     <p className="mt-2 text-2xl font-black text-stone-900">{isConfirming ? 'Confirming' : 'Listening for ideas'}</p>
                     <p className="mt-2 text-sm leading-6 text-stone-600">
-                      {isConfirming ? 'Check the answer before we move to the next prompt.' : 'Say the answer out loud, then we’ll help shape it.'}
+                      {isConfirming ? 'Check the answer before we move to the next prompt.' : step === 'story' ? 'Start with a quick retell, then we will break it into simple questions.' : 'Say the answer out loud, then we’ll help shape it.'}
                     </p>
                   </div>
                 </div>
@@ -1127,7 +1863,7 @@ General rules:
                      <div className="w-9" />
                    )}
                    <div className="flex gap-2 flex-1">
-                    {['who', 'what', 'when', 'where', 'why', 'how'].map(s => (
+                    {fiveWSteps.map(s => (
                       <div key={s} className={`h-3 flex-1 rounded-full transition-all duration-500 ${step === s ? 'bg-blue-500 shadow-md' : answers[s] ? 'bg-green-400' : 'bg-gray-100'}`} />
                     ))}
                   </div>
@@ -1148,20 +1884,20 @@ General rules:
                   <p className="text-sm font-semibold text-stone-500">
                     {canGoToPreviousQuestion
                       ? 'Need to fix something? Go back one question without losing the flow.'
-                      : 'You are on the first question. Tap to leave this flow and return home.'}
+                      : 'Start with a quick story idea. Tap to leave this flow and return home.'}
                   </p>
                 </div>
                 
                 <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr] items-stretch">
-                  <div className={`p-6 sm:p-8 md:p-10 rounded-[2rem] sm:rounded-[2.5rem] min-h-[220px] flex items-center text-left text-2xl sm:text-3xl md:text-4xl font-bold italic border transition-all duration-300 shadow-[0_18px_40px_rgba(148,101,47,0.08)] ${isConfirming ? 'bg-[linear-gradient(180deg,_#fff4e8,_#fff8f1)] text-orange-900 border-orange-100' : 'bg-[linear-gradient(180deg,_#eef7ff,_#f5fbff)] text-sky-900 border-sky-100'}`}>
+                  <div className={`p-8 md:p-10 rounded-[2.5rem] min-h-[220px] flex items-center text-left text-3xl md:text-4xl font-bold italic border transition-all duration-300 shadow-[0_18px_40px_rgba(148,101,47,0.08)] ${isConfirming ? 'bg-[linear-gradient(180deg,_#fff4e8,_#fff8f1)] text-orange-900 border-orange-100' : 'bg-[linear-gradient(180deg,_#eef7ff,_#f5fbff)] text-sky-900 border-sky-100'}`}>
                     {userInput || (
-                      <span className="not-italic text-lg sm:text-xl md:text-2xl font-semibold text-stone-400">
+                      <span className="not-italic text-xl md:text-2xl font-semibold text-stone-400">
                         {isListening ? (isMockMode ? "Mocking input..." : "Listening for your answer...") : 'Tap the microphone and answer in your own words.'}
                       </span>
                     )}
                   </div>
 
-                  <div className="rounded-[2rem] sm:rounded-[2.5rem] border border-white/80 bg-white/75 p-5 sm:p-6 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
+                  <div className="rounded-[2.5rem] border border-white/80 bg-white/75 p-6 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
                     <div>
                       <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Why this helps</p>
                       <p className="mt-3 text-2xl font-black text-stone-900">
@@ -1169,12 +1905,32 @@ General rules:
                       </p>
                     </div>
                     <div className="mt-6 grid grid-cols-3 gap-3">
-                      {['Speak', 'Check', 'Next'].map((label, index) => (
-                        <div key={label} className={`rounded-[1.25rem] px-3 py-4 text-center text-sm font-black uppercase tracking-[0.14em] ${index === 1 && isConfirming ? 'bg-orange-100 text-orange-900' : 'bg-stone-100 text-stone-500'}`}>
-                          {label}
+                      {getFlowSummaryCards().map((card) => (
+                        <div key={card.label} className={`rounded-[1.25rem] px-3 py-4 text-center ${card.active ? 'bg-orange-100 text-orange-900' : 'bg-stone-100 text-stone-500'}`}>
+                          <p className="text-[11px] font-black uppercase tracking-[0.14em]">{card.label}</p>
+                          <p className="mt-2 text-sm font-black capitalize">{card.value}</p>
                         </div>
                       ))}
                     </div>
+
+                    {isLocal && (
+                      <div className="mt-6 rounded-[1.4rem] border border-stone-200 bg-stone-900 p-4 text-left text-white">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-stone-300">Local debug</p>
+                        <div className="mt-3 space-y-2 text-xs text-stone-100">
+                          {getLocalDebugRows().map((row) => (
+                            <div key={row.label} className="flex items-start justify-between gap-3">
+                              <span className="shrink-0 font-black uppercase tracking-[0.16em] text-stone-400">{row.label}</span>
+                              <span
+                                className="text-right text-stone-100"
+                                data-testid={`debug-${row.label.toLowerCase().replace(/\s+/g, '-')}`}
+                              >
+                                {row.value}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -1194,7 +1950,7 @@ General rules:
                 )} */}
 
                 <div className="mt-auto pb-4 flex flex-col items-center gap-4">
-                  <button onClick={() => {stopListening(); startListening();}} className={`w-20 h-20 md:w-24 md:h-24 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 relative border border-white/70 ${isListening ? 'bg-red-500 scale-105 shadow-red-200' : 'bg-[linear-gradient(135deg,_#1d4ed8,_#0f766e)] hover:scale-105 active:scale-95 shadow-blue-200'}`}>
+                  <button onClick={() => {stopListening(); startListening();}} data-testid="guided-mic-button" className={`w-20 h-20 md:w-24 md:h-24 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 relative border border-white/70 ${isListening ? 'bg-red-500 scale-105 shadow-red-200' : 'bg-[linear-gradient(135deg,_#1d4ed8,_#0f766e)] hover:scale-105 active:scale-95 shadow-blue-200'}`}>
                     <Mic className="text-white w-8 h-8 md:w-9 md:h-9" />
                     {isListening && <span className="absolute inset-0 rounded-full bg-red-400 animate-ping opacity-75"></span>}
                   </button>
@@ -1214,9 +1970,9 @@ General rules:
 
             {step === 'result' && (
               <div className="w-full space-y-8 animate-in fade-in">
-                <div className="bg-orange-50 p-5 sm:p-8 rounded-[2rem] sm:rounded-[2.5rem] border-4 border-orange-100 text-left relative shadow-inner">
+                <div className="bg-orange-50 p-8 rounded-[2.5rem] border-4 border-orange-100 text-left relative shadow-inner">
                   <button onClick={() => speakText(generatedJournal)} className="absolute top-4 right-4 p-3 bg-white rounded-full shadow-md"><Volume2 className="text-orange-500 w-6 h-6" /></button>
-                  <p className="text-lg sm:text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
+                  <p className="text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
                 </div>
                 {/* Illustration preview intentionally disabled for now.
                 <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-8 border-white bg-gray-50 min-h-[300px] flex items-center justify-center">
@@ -1234,9 +1990,9 @@ General rules:
                   )}
                 </div>
                 */}
-                <div className="flex flex-col gap-4 sm:flex-row">
+                <div className="flex gap-4">
                   <button onClick={() => setStep('idle')} className="flex-1 py-5 bg-gray-100 rounded-2xl font-black text-gray-500">Restart</button>
-                  <button onClick={() => setView('journaling')} className="flex-1 py-5 bg-green-500 text-white rounded-2xl font-black text-xl shadow-lg flex items-center justify-center gap-2">Start Writing <ChevronRight /></button>
+                  <button onClick={goToWritingPage} className="flex-1 py-5 bg-green-500 text-white rounded-2xl font-black text-xl shadow-lg flex items-center justify-center gap-2">Start Writing <ChevronRight /></button>
                 </div>
               </div>
             )}
@@ -1264,14 +2020,14 @@ General rules:
             </div>
 
             {/* Key Idea Area - Yellow Sticky Note Style */}
-            <div className="bg-yellow-50 p-5 sm:p-6 rounded-[1.75rem] sm:rounded-[2rem] border-2 border-yellow-200 shadow-sm relative flex-shrink-0">
+            <div className="bg-yellow-50 p-6 rounded-[2rem] border-2 border-yellow-200 shadow-sm relative flex-shrink-0">
                 <div className="flex justify-between items-center mb-2">
                     <p className="text-xs text-yellow-800 font-black uppercase tracking-widest">💡 Key Idea:</p>
                     <button onClick={() => speakText(generatedJournal)} className="p-2 bg-white rounded-full shadow-sm hover:scale-110 transition-transform">
                         <Volume2 className="text-orange-500 w-5 h-5" />
                     </button>
                 </div>
-                <p className="text-lg sm:text-xl text-yellow-900 font-bold leading-relaxed pr-2 text-left">
+                <p className="text-xl text-yellow-900 font-bold leading-relaxed pr-2 text-left">
                     {generatedJournal}
                 </p>
             </div>
@@ -1292,16 +2048,12 @@ General rules:
                     {spellResult}
                 </div>
               )}
+
+              <p className="text-center text-sm font-semibold text-stone-500">
+                Say “how do I spell …” any time and Writing Buddy will spell it slowly.
+              </p>
               
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                <button onClick={handleSpellAssistPress} className={`min-w-0 px-4 py-4 rounded-[1.75rem] shadow-lg flex items-center justify-center gap-3 transition-all ${isListening ? 'bg-red-500 scale-[1.02]' : 'bg-blue-600 hover:bg-blue-700'} text-white`}>
-                    <Mic className="w-6 h-6 flex-shrink-0" />
-                    <div className="text-left min-w-0">
-                        <p className="font-black text-sm leading-none uppercase tracking-[0.12em]">How to spell</p>
-                        <p className="text-[10px] opacity-70 truncate">Slow letter-by-letter help</p>
-                    </div>
-                </button>
-                
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <button onClick={() => setShowUploadModal(true)} className="min-w-0 px-4 py-4 bg-gradient-to-r from-indigo-600 to-blue-600 text-white rounded-[1.75rem] font-black text-sm uppercase tracking-[0.14em] shadow-xl flex items-center justify-center gap-3">
                     <Award className="w-6 h-6 flex-shrink-0" /> All Finished
                 </button>
@@ -1319,29 +2071,29 @@ General rules:
         )}
 
         {showUploadModal && (
-            <div className="absolute inset-0 bg-black/60 backdrop-blur-xl z-50 flex items-center justify-center p-4 sm:p-8 text-center">
-            <div className="bg-white w-full max-w-lg rounded-[2.5rem] sm:rounded-[4rem] p-6 sm:p-8 md:p-12 shadow-2xl animate-in zoom-in duration-300">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-xl z-50 flex items-center justify-center p-8 text-center">
+            <div className="bg-white w-full max-w-lg rounded-[4rem] p-12 shadow-2xl animate-in zoom-in duration-300">
               {!cameraMode ? (
                 <div className="space-y-10">
-                    <div className="w-24 h-24 sm:w-28 sm:h-28 bg-blue-100 rounded-full flex items-center justify-center mx-auto shadow-inner">
+                  <div className="w-28 h-28 bg-blue-100 rounded-full flex items-center justify-center mx-auto shadow-inner">
                     <Camera className="text-blue-600 w-14 h-14" />
                   </div>
                   <div className="space-y-4">
-                      <h3 className="text-3xl sm:text-4xl font-black text-gray-800 tracking-tighter">Save your paper?</h3>
-                      <p className="text-xl sm:text-2xl text-gray-400 font-bold leading-tight">Take a photo of your paper journal!</p>
+                    <h3 className="text-4xl font-black text-gray-800 tracking-tighter">Save your paper?</h3>
+                    <p className="text-2xl text-gray-400 font-bold leading-tight">Take a photo of your paper journal!</p>
                   </div>
                   <div className="flex flex-col gap-4">
-                    <button onClick={startCamera} className="py-5 sm:py-7 bg-blue-500 text-white rounded-[2rem] sm:rounded-[2.5rem] font-black text-lg sm:text-2xl flex items-center justify-center gap-3 sm:gap-4 shadow-xl hover:bg-blue-600">
+                    <button onClick={startCamera} className="py-7 bg-blue-500 text-white rounded-[2.5rem] font-black text-2xl flex items-center justify-center gap-4 shadow-xl hover:bg-blue-600">
                       <Camera size={32} /> Take a Photo
                     </button>
-                    <button onClick={() => uploadPhoto(false)} className="py-5 sm:py-7 bg-gray-100 text-gray-500 rounded-[2rem] sm:rounded-[2.5rem] font-black text-lg sm:text-2xl">
+                    <button onClick={() => uploadPhoto(false)} className="py-7 bg-gray-100 text-gray-500 rounded-[2.5rem] font-black text-2xl">
                       No, just save digital
                     </button>
                   </div>
                 </div>
               ) : (
                 <div className="space-y-8">
-                  <div className="rounded-[2rem] sm:rounded-[3rem] overflow-hidden bg-black aspect-[3/4] relative border-4 sm:border-8 border-gray-100 shadow-inner">
+                  <div className="rounded-[3rem] overflow-hidden bg-black aspect-[3/4] relative border-8 border-gray-100 shadow-inner">
                     {!capturedImage ? (
                       <>
                         <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
@@ -1353,8 +2105,8 @@ General rules:
                   </div>
                   {capturedImage ? (
                     <div className="flex gap-4">
-                      <button onClick={() => {setCapturedImage(null); startCamera();}} className="flex-1 py-5 sm:py-6 bg-gray-100 rounded-[1.75rem] sm:rounded-[2rem] font-black text-lg sm:text-xl">Retake</button>
-                      <button onClick={() => uploadPhoto(true)} className="flex-1 py-5 sm:py-6 bg-green-500 text-white rounded-[1.75rem] sm:rounded-[2rem] font-black text-lg sm:text-xl flex items-center justify-center gap-3 shadow-lg">
+                      <button onClick={() => {setCapturedImage(null); startCamera();}} className="flex-1 py-6 bg-gray-100 rounded-[2rem] font-black text-xl">Retake</button>
+                      <button onClick={() => uploadPhoto(true)} className="flex-1 py-6 bg-green-500 text-white rounded-[2rem] font-black text-xl flex items-center justify-center gap-3 shadow-lg">
                         {isSaving ? <RefreshCw className="animate-spin" /> : <><Check size={28} /> Looks Great!</>}
                       </button>
                     </div>
@@ -1369,11 +2121,11 @@ General rules:
 
         {showCustomExpectationModal && (
           <div className="absolute inset-0 bg-black/45 backdrop-blur-xl z-50 flex items-center justify-center p-6 md:p-8 text-left">
-            <div className="w-full max-w-2xl rounded-[2rem] sm:rounded-[2.5rem] bg-white p-5 sm:p-8 md:p-10 shadow-2xl animate-in zoom-in duration-300">
+            <div className="w-full max-w-2xl rounded-[2.5rem] bg-white p-8 md:p-10 shadow-2xl animate-in zoom-in duration-300">
               <div className="space-y-6">
                 <div className="space-y-3">
                   <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Custom expectation</p>
-                  <h3 className="text-2xl sm:text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Writing Buddy what to prioritize.</h3>
+                  <h3 className="text-3xl md:text-4xl font-black tracking-[-0.04em] text-stone-900">Tell Writing Buddy what to prioritize.</h3>
                   <p className="text-base leading-7 text-stone-600">
                     Example: use shorter sentences, encourage more descriptive words, keep the tone gentle, or focus on confidence with punctuation.
                   </p>
@@ -1447,7 +2199,7 @@ General rules:
 
       </main>
 
-      <footer className="mt-8 px-4 text-center text-sm sm:text-base text-orange-300 font-bold">Built for {grade} Students • Step by Step Learning</footer>
+      <footer className="mt-10 text-center text-orange-300 font-bold">Built for {grade} Students • Step by Step Writing</footer>
     </div>
   );
 };
