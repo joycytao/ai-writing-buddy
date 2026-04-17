@@ -2010,13 +2010,6 @@ General rules:
                       <p className="text-sm font-semibold text-gray-400">Keep the story handy while you write on paper.</p>
                     </div>
                 </div>
-                <button
-                  onClick={goToStoryPreview}
-                  className="min-w-0 rounded-[1.75rem] bg-white px-4 py-4 text-sm font-black uppercase tracking-[0.14em] text-stone-700 shadow-sm ring-1 ring-stone-200 transition-colors hover:bg-stone-50 flex items-center justify-center gap-2 self-start"
-                >
-                  <ArrowLeft size={16} />
-                  Story Preview
-                </button>
             </div>
 
             {/* Key Idea Area - Yellow Sticky Note Style */}
@@ -2053,9 +2046,21 @@ General rules:
                 Say “how do I spell …” any time and Writing Buddy will spell it slowly.
               </p>
               
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <button onClick={() => setShowUploadModal(true)} className="min-w-0 px-4 py-4 bg-gradient-to-r from-indigo-600 to-blue-600 text-white rounded-[1.75rem] font-black text-sm uppercase tracking-[0.14em] shadow-xl flex items-center justify-center gap-3">
-                    <Award className="w-6 h-6 flex-shrink-0" /> All Finished
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <button
+                  onClick={goToStoryPreview}
+                  className="min-w-0 rounded-[1.75rem] bg-white px-4 py-4 text-sm font-black uppercase tracking-[0.14em] text-stone-700 shadow-sm ring-1 ring-stone-200 transition-colors hover:bg-stone-50 flex items-center justify-center gap-2"
+                >
+                  <ArrowLeft size={16} />
+                  Back
+                </button>
+
+                <button onClick={handleSpellAssistPress} className={`min-w-0 px-4 py-4 rounded-[1.75rem] shadow-lg flex items-center justify-center gap-3 transition-all ${isListening ? 'bg-red-500 scale-[1.02]' : 'bg-blue-600 hover:bg-blue-700'} text-white`}>
+                    <Mic className="w-6 h-6 flex-shrink-0" />
+                    <div className="text-left min-w-0">
+                        <p className="font-black text-sm leading-none uppercase tracking-[0.12em]">Spell</p>
+                        <p className="text-[10px] opacity-70 truncate">Slow letter-by-letter help</p>
+                    </div>
                 </button>
 
                 <button

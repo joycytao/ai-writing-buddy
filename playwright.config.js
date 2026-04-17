@@ -23,5 +23,17 @@ export default defineConfig({
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
     },
+    {
+      name: 'iphone-13',
+      use: { ...devices['iPhone 13'] },
+    },
+    {
+      name: 'ipad-pro-11',
+      use: { ...devices['iPad Pro 11'] },
+    },
+    {
+      name: 'pixel-7',
+      use: { ...devices['Pixel 7'] },
+    },
   ],
 });
