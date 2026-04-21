@@ -2045,7 +2045,6 @@ General rules:
               <p className="text-center text-sm font-semibold text-stone-500">
                 Say “how do I spell …” any time and Writing Buddy will spell it slowly.
               </p>
-              
               <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
                 <button
                   onClick={goToStoryPreview}
@@ -2055,7 +2054,7 @@ General rules:
                   Back
                 </button>
 
-                <button onClick={handleSpellAssistPress} className={`min-w-0 px-4 py-4 rounded-[1.75rem] shadow-lg flex items-center justify-center gap-3 transition-all ${isListening ? 'bg-red-500 scale-[1.02]' : 'bg-blue-600 hover:bg-blue-700'} text-white`}>
+                <button onClick={handleSpellAssistPress} className={`invisible min-w-0 px-4 py-4 rounded-[1.75rem] shadow-lg flex items-center justify-center gap-3 transition-all ${isListening ? 'bg-red-500 scale-[1.02]' : 'bg-blue-600 hover:bg-blue-700'} text-white`}>
                     <Mic className="w-6 h-6 flex-shrink-0" />
                     <div className="text-left min-w-0">
                         <p className="font-black text-sm leading-none uppercase tracking-[0.12em]">Spell</p>
