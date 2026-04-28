@@ -3,23 +3,42 @@ import React, { useState, useEffect, useRef } from 'react';
 import { initializeApp } from "firebase/app";
 import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import LandingView from './features/landing/LandingView';
+import { featureCards } from './features/landing/config';
+import { getLandingIntent } from './features/landing/intent';
+import ReadingTutorView from './features/reading-tutor/ReadingTutorView';
+import readingTutoringInstructionMarkdown from './features/reading-tutor/reading_tutoring_instruction.md?raw';
+import StoryADayView from './features/story-a-day/StoryADayView';
+import SpellingChampionView from './features/spelling-champion/SpellingChampionView';
+import SightwordsMasterView from './features/sightwords-master/SightwordsMasterView';
+import ChineseLiteracyView from './features/chinese-literacy/ChineseLiteracyView';
+import { pickLeitnerWordsForToday, resolvePracticeDate } from './features/sightwords-master/leitnerSchedule';
+import WritingHomeView from './features/writing-journal/WritingHomeView';
+import WritingJournalView from './features/writing-journal/WritingJournalView';
+import CloudReferenceSettings from './features/cloud-references/CloudReferenceSettings';
+import { loadWordsFromLinkedReferences, clearWordsCacheForReferences, loadWorksheetTextFromLinkedReferences, loadWorksheetTargetTextFromLinkedReferences, loadWorksheetSourceFileFromLinkedReferences } from './features/cloud-references/documentWordLoader';
+import { parseWorksheetDocument, getWorksheetUnitForDate, extractWorksheetSectionForWeekDay } from './features/reading-tutor/worksheetParser';
+import {
+  loadCloudReferenceState,
+  removeCloudReference,
+  saveCloudConnections,
+  saveCloudReference,
+  loadFeatureWordBank,
+  upsertFeatureWord,
+  upsertFeatureWords,
+  removeFeatureWord,
+} from './features/cloud-references/storage';
+import { connectGoogleDrive, listGoogleDriveChildren } from './features/cloud-references/googleDrive';
+import { connectOneDrive, listOneDriveChildren } from './features/cloud-references/oneDrive';
+import useSpeechRecognitionLifecycle from './shared/voice/useSpeechRecognitionLifecycle';
 import { 
   Mic, 
   Settings, 
   BookOpen, 
-  Send, 
-  Volume2, 
-  HelpCircle, 
   RefreshCw, 
-  Award, 
-  ChevronRight,
-  ChevronLeft,
-  CheckCircle2,
-  ArrowRight,
-  ArrowLeft,
   FlaskConical,
-  Sparkles,
-  Camera
+  Camera,
+  Check
 } from 'lucide-react';
 
 const firebaseConfig = {
@@ -43,6 +62,8 @@ const isLocal = window.location.hostname === 'localhost' || window.location.host
 const guidedFlow = ['story', 'who', 'what', 'when', 'where', 'why', 'how'];
 const fiveWSteps = ['who', 'what', 'when', 'where', 'why', 'how'];
 const geminiLiveModel = 'gemini-3.1-flash-live-preview';
+const readingTutorLiveModel = 'gemini-3.1-flash-live';
+const readingTutorLiveFallbackModel = 'gemini-3.1-flash-live-preview';
 const geminiLiveFunctionName = 'capture_story_step';
 const geminiLiveFunctionDeclaration = {
   name: geminiLiveFunctionName,
@@ -87,15 +108,272 @@ Rules:
 - If the next step is generating, set question to an empty string.
 - Always echo the requestId exactly.`;
 
+const readingTutorLiveSystemInstruction = `${String(readingTutoringInstructionMarkdown || '').trim()}
+
+Output requirements:
+- Speak to one student turn at a time.
+- Never provide direct final answers to comprehension questions unless explicitly asked.
+- Keep each response concise, actionable, and age-appropriate.`;
+
+const featureIdAliases = {
+  'writing-journal': 'writing-journal',
+  writingJournal: 'writing-journal',
+  home: 'writing-journal',
+  'reading-tutor': 'reading-tutor',
+  readingTutor: 'reading-tutor',
+  'story-a-day': 'story-a-day',
+  storyADay: 'story-a-day',
+  'spelling-champion': 'spelling-champion',
+  spellingChampion: 'spelling-champion',
+  'sightwords-master': 'sightwords-master',
+  sightwordsMaster: 'sightwords-master',
+  'chinese-literacy': 'chinese-literacy',
+  chineseLiteracy: 'chinese-literacy',
+};
+
+const simplifiedFeatureAliases = {
+  writingjournal: 'writing-journal',
+  journalbuddy: 'writing-journal',
+  home: 'writing-journal',
+  readingtutor: 'reading-tutor',
+  storyaday: 'story-a-day',
+  astoryaday: 'story-a-day',
+  spellingchampion: 'spelling-champion',
+  sightwordsmaster: 'sightwords-master',
+  sightwordschampion: 'sightwords-master',
+  chineseliteracy: 'chinese-literacy',
+};
+
+const simplifyFeatureKey = (value = '') => String(value || '').toLowerCase().replace(/[^a-z]/g, '');
+
+const normalizeFeatureId = (value = '') => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (featureIdAliases[raw]) return featureIdAliases[raw];
+  if (raw.includes('識字高手')) return 'chinese-literacy';
+
+  const simplified = simplifyFeatureKey(raw);
+  if (featureIdAliases[simplified]) return featureIdAliases[simplified];
+  if (simplifiedFeatureAliases[simplified]) return simplifiedFeatureAliases[simplified];
+
+  return raw;
+};
+
+const normalizeLinkedResource = (resource = {}) => ({
+  ...resource,
+  feature: normalizeFeatureId(resource.feature || ''),
+});
+
+const createLinkedResourceDedupKey = (resource = {}) => {
+  const provider = String(resource.provider || '').trim().toLowerCase();
+  const feature = normalizeFeatureId(resource.feature || '');
+  const sourceId = String(resource.sourceId || '').trim().toLowerCase();
+  const target = String(resource.target || '').trim().toLowerCase();
+  return `${provider}::${feature}::${sourceId || target}`;
+};
+
+const dedupeLinkedResources = (resources = []) => {
+  const seen = new Set();
+  return [...resources]
+    .sort((left, right) => {
+      const leftIso = String(left?.createdAtIso || '');
+      const rightIso = String(right?.createdAtIso || '');
+      return rightIso.localeCompare(leftIso);
+    })
+    .filter((resource) => {
+      const key = createLinkedResourceDedupKey(resource);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
+const isCloudSessionValid = (session) => {
+  if (!session?.accessToken) return false;
+  const expiresAt = Number(session.expiresAt || 0);
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return false;
+  return Date.now() < expiresAt;
+};
+
+const getEffectiveCloudConnections = (connections = {}, sessions = {}) => ({
+  googleDrive: Boolean(connections.googleDrive) && isCloudSessionValid(sessions.googleDrive),
+  oneDrive: Boolean(connections.oneDrive) && isCloudSessionValid(sessions.oneDrive),
+});
+
+const hiddenLandingFeatureIds = new Set(['story-a-day', 'reading-tutor']);
+
+const SPELLING_CACHE_KEY = 'journal_buddy_spelling_cache';
+const SPELLING_HISTORY_KEY = 'journal_buddy_spelling_history';
+const SPELLING_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SPELLING_TEACHER_SYSTEM_PROMPT = 'You are an experienced teacher and expert on phonetic awareness.';
+const SIGHTWORD_TEACHER_SYSTEM_PROMPT = `You are an experienced, patient, and fun English Teacher specializing in early childhood literacy. Your mission is to help kids sharpen and enhance their Sight Words and reading fluency.
+
+Core Competencies:
+
+Accent & Noise Tolerance: You must be highly adaptive to various accents, stuttering, repetitive words, or "messy" speech patterns typical of kids learning to read. You excel at deciphering the "true intent" behind broken English.
+
+Encouraging Tone: You always provide positive reinforcement. If a child makes a mistake, you gently guide them to the right answer without being discouraging.`;
+const CHINESE_LITERACY_TEACHER_SYSTEM_PROMPT = `你是一位有經驗、耐心且有趣的中文老師，專門幫助兒童識字與閱讀流暢度。
+
+核心能力：
+
+口音與雜訊容錯：你能高度適應不同口音、口吃、重複詞與兒童常見的不完整語句，擅長判斷孩子真正想表達的內容。
+
+鼓勵式語氣：你總是先肯定孩子的努力。即使答錯，也用溫柔、具體的方式引導到正確答案，不打擊信心。`;
+
+const normalizeWordToken = (value = '') => String(value || '').trim().toLowerCase();
+
+const normalizeSpokenPhrase = (value = '') => String(value || '')
+  .toLowerCase()
+  .replace(/[\u2019]/g, "'")
+  .replace(/[^a-z\u3400-\u9fff'\s-]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const isCjkToken = (value = '') => /[\u3400-\u9fff]/.test(value);
+
+const getSchoolWeekNumber = (date = new Date()) => {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  const day = d.getDay() || 7;
+  d.setDate(d.getDate() + 4 - day);
+  const yearStart = new Date(d.getFullYear(), 0, 1);
+  return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+};
+
+const getSchoolDayNumber = (date = new Date()) => {
+  const day = date.getDay();
+  if (day === 0) return 1;
+  if (day === 6) return 5;
+  return Math.min(5, Math.max(1, day));
+};
+
+const READING_KEYWORD_STOPWORDS = new Set([
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'which', 'who', 'when', 'where', 'why', 'how',
+  'did', 'does', 'do', 'to', 'from', 'with', 'and', 'or', 'in', 'on', 'at', 'of', 'for', 'this', 'that',
+]);
+
+const extractQuestionKeywords = (questionStem = '', maxTerms = 3) => {
+  const words = String(questionStem || '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter((word) => word.length >= 4 && !READING_KEYWORD_STOPWORDS.has(word));
+
+  return Array.from(new Set(words)).slice(0, maxTerms);
+};
+
+const matchesSpokenWord = (expectedRaw = '', spokenRaw = '') => {
+  const expected = normalizeSpokenPhrase(expectedRaw);
+  const spoken = normalizeSpokenPhrase(spokenRaw);
+  if (!expected || !spoken) return false;
+  if (expected === spoken) return true;
+
+  if (isCjkToken(expected)) {
+    return spoken.includes(expected);
+  }
+
+  const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const wordBoundaryMatch = new RegExp(`(^|\\s)${escaped}($|\\s)`).test(spoken);
+  if (wordBoundaryMatch) return true;
+  return false;
+};
+
+const levenshteinDistance = (left = '', right = '') => {
+  const a = String(left || '');
+  const b = String(right || '');
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const matrix = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) matrix[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) matrix[0][j] = j;
+
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+
+  return matrix[a.length][b.length];
+};
+
+const likelySpokenTokenMatch = (expectedRaw = '', spokenRaw = '') => {
+  const expected = normalizeWordToken(expectedRaw);
+  const spokenTokens = normalizeSpokenPhrase(spokenRaw)
+    .split(' ')
+    .map((token) => normalizeWordToken(token))
+    .filter(Boolean)
+    .slice(0, 4);
+
+  if (!expected || !spokenTokens.length || isCjkToken(expected)) return false;
+
+  return spokenTokens.some((token) => {
+    if (token === expected) return true;
+    const maxDistance = expected.length <= 4 ? 1 : 2;
+    return levenshteinDistance(token, expected) <= maxDistance;
+  });
+};
+
+const spellOutWordNaturally = (value = '') => String(value || '')
+  .trim()
+  .split('')
+  .map((char) => char.toLowerCase())
+  .join(', ');
+
+const shuffled = (items = []) => {
+  const cloned = [...items];
+  for (let i = cloned.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = cloned[i];
+    cloned[i] = cloned[j];
+    cloned[j] = tmp;
+  }
+  return cloned;
+};
+
 
   const App = () => {
   // --- 狀態管理 ---
   const [user, setUser] = useState(null);
-  const [view, setView] = useState('home'); 
+  const [view, setView] = useState('landing'); 
   const [studentName, setStudentName] = useState(() => localStorage.getItem('journal_buddy_name') || ''); 
   const [grade, setGrade] = useState(() => localStorage.getItem('journal_buddy_grade') || 'Kindergarten'); 
   const [customExpectation, setCustomExpectation] = useState(() => localStorage.getItem('journal_buddy_custom_expectation') || '');
   const [draftCustomExpectation, setDraftCustomExpectation] = useState(() => localStorage.getItem('journal_buddy_custom_expectation') || '');
+  const [selectedCustomizeFeature, setSelectedCustomizeFeature] = useState('writing-journal');
+  const [featureCustomMessages, setFeatureCustomMessages] = useState(() => {
+    const defaultMessages = {
+      'writing-journal': '',
+      'reading-tutor': '',
+      'story-a-day': '',
+      'spelling-champion': '',
+      'sightwords-master': '',
+      'chinese-literacy': '',
+    };
+
+    try {
+      const stored = JSON.parse(localStorage.getItem('journal_buddy_feature_custom_messages') || '{}');
+      const legacyWriting = localStorage.getItem('journal_buddy_custom_expectation') || '';
+      return {
+        ...defaultMessages,
+        ...Object.fromEntries(Object.entries(stored).map(([key, value]) => [normalizeFeatureId(key), value || ''])),
+        'writing-journal': (stored['writing-journal'] || legacyWriting || '').trim(),
+      };
+    } catch {
+      return {
+        ...defaultMessages,
+        'writing-journal': (localStorage.getItem('journal_buddy_custom_expectation') || '').trim(),
+      };
+    }
+  });
+  const [draftFeatureCustomMessage, setDraftFeatureCustomMessage] = useState('');
   const [isCustomListening, setIsCustomListening] = useState(false);
   const [step, setStep] = useState('idle'); 
   const [isConfirming, setIsConfirming] = useState(false); 
@@ -124,8 +402,178 @@ Rules:
   const [lastTranscript, setLastTranscript] = useState('');
   const [lastRecognitionState, setLastRecognitionState] = useState('Idle');
   const [liveRawPreview, setLiveRawPreview] = useState('');
+  const [cloudConnections, setCloudConnections] = useState(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('journal_buddy_cloud_connections') || '{}');
+      return {
+        googleDrive: Boolean(parsed.googleDrive),
+        oneDrive: Boolean(parsed.oneDrive),
+      };
+    } catch {
+      return { googleDrive: false, oneDrive: false };
+    }
+  });
+  const [linkedResources, setLinkedResources] = useState(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('journal_buddy_linked_resources') || '[]');
+      return Array.isArray(parsed) ? dedupeLinkedResources(parsed.map(normalizeLinkedResource)) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [linkDraft, setLinkDraft] = useState({
+    provider: '',
+    feature: '',
+    target: '',
+    selectedName: '',
+    selectedType: '',
+    sourceId: '',
+    selectedMimeType: '',
+    selectedModifiedTime: '',
+  });
+  const [cloudWordBanks, setCloudWordBanks] = useState({
+    'reading-tutor': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+    'story-a-day': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+    'spelling-champion': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+    'sightwords-master': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+    'chinese-literacy': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+  });
+  const [featureWordBanks, setFeatureWordBanks] = useState({
+    'sightwords-master': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+    'chinese-literacy': {
+      words: [],
+      isLoading: false,
+      error: '',
+      loadedAtIso: '',
+    },
+  });
+  const [featurePracticeSession, setFeaturePracticeSession] = useState({
+    active: false,
+    featureId: '',
+    index: 0,
+    words: [],
+    feedback: '',
+    finished: false,
+  });
+  const [spellingCache, setSpellingCache] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(SPELLING_CACHE_KEY) || '{}');
+      const expiresAt = Number(stored.expiresAt || 0);
+      const words = Array.isArray(stored.words) ? stored.words : [];
+      if (!expiresAt || Date.now() > expiresAt || words.length === 0) {
+        return { words: [], expiresAt: 0 };
+      }
+      return { words, expiresAt };
+    } catch {
+      return { words: [], expiresAt: 0 };
+    }
+  });
+  const [spellingHistory, setSpellingHistory] = useState(() => {
+    try {
+      const stored = JSON.parse(localStorage.getItem(SPELLING_HISTORY_KEY) || '[]');
+      return Array.isArray(stored) ? stored : [];
+    } catch {
+      return [];
+    }
+  });
+  const [spellingPracticeState, setSpellingPracticeState] = useState({
+    open: false,
+    index: 0,
+  });
+  const [spellingQuizState, setSpellingQuizState] = useState({
+    open: false,
+    index: 0,
+    words: [],
+    answer: '',
+    score: 0,
+    feedback: '',
+    awaitingVoiceAnswer: false,
+  });
+  const [featureActionMessage, setFeatureActionMessage] = useState('');
+  const [readingTutorFeedback, setReadingTutorFeedback] = useState('');
+  const [readingPracticeFeatureId, setReadingPracticeFeatureId] = useState('reading-tutor');
+  const [readingTutorTranscriptBuffer, setReadingTutorTranscriptBuffer] = useState('');
+  const [readingTutorContinuousListening, setReadingTutorContinuousListening] = useState(false);
+  const [readingTutorWorksheetData, setReadingTutorWorksheetData] = useState({ units: [], byWeekDay: {}, warnings: [] });
+  const [readingTutorActiveUnit, setReadingTutorActiveUnit] = useState(null);
+  const [readingTutorWeekNumber, setReadingTutorWeekNumber] = useState(1);
+  const [readingTutorDayNumber, setReadingTutorDayNumber] = useState(1);
+  const [readingTutorQuestionIndex, setReadingTutorQuestionIndex] = useState(0);
+  const [readingTutorScore, setReadingTutorScore] = useState(0);
+  const [readingTutorAnswers, setReadingTutorAnswers] = useState({});
+  const [readingTutorHighlightTerms, setReadingTutorHighlightTerms] = useState([]);
+  const [readingTutorCelebrating, setReadingTutorCelebrating] = useState(false);
+  const [readingTutorIllustrationUrl, setReadingTutorIllustrationUrl] = useState('');
+  const [readingTutorImageStatus, setReadingTutorImageStatus] = useState('idle');
+  const [readingTutorUnfamiliarWords, setReadingTutorUnfamiliarWords] = useState([]);
+  const [readingTutorWordReviewInProgress, setReadingTutorWordReviewInProgress] = useState(false);
+  const [readingTutorWordReviewCompleted, setReadingTutorWordReviewCompleted] = useState(false);
+  const [readingTutorReviewWordIndex, setReadingTutorReviewWordIndex] = useState(0);
+  const [readingTutorReadingDoneSignal, setReadingTutorReadingDoneSignal] = useState(0);
+  const [readingTutorDiscussionQuestion, setReadingTutorDiscussionQuestion] = useState('');
+  const [readingTutorDiscussionTurns, setReadingTutorDiscussionTurns] = useState(0);
+  const [readingTutorDiscussionDone, setReadingTutorDiscussionDone] = useState(false);
+  const [readingTutorSession, setReadingTutorSession] = useState({
+    worksheetTopic: '',
+    awaitingQuestionLabel: false,
+    awaitingQuestionRead: false,
+    currentQuestionLabel: '',
+  });
+  const [isCloudStateReady, setIsCloudStateReady] = useState(false);
+  const [cloudActionError, setCloudActionError] = useState('');
+  const [isCloudActionBusy, setIsCloudActionBusy] = useState(false);
+  const [cloudConnectProvider, setCloudConnectProvider] = useState('googleDrive');
+  const [cloudSessions, setCloudSessions] = useState(() => {
+    try {
+      const parsed = JSON.parse(sessionStorage.getItem('journal_buddy_cloud_sessions') || '{}');
+      return {
+        googleDrive: parsed.googleDrive || null,
+        oneDrive: parsed.oneDrive || null,
+      };
+    } catch {
+      return { googleDrive: null, oneDrive: null };
+    }
+  });
+  const [cloudBrowser, setCloudBrowser] = useState({
+    open: false,
+    provider: '',
+    isLoading: false,
+    error: '',
+    items: [],
+    path: [{ id: 'root', name: 'Root' }],
+  });
+  const hasLoadedCloudStateRef = useRef(false);
 
-  const recognitionRef = useRef(null);
   const customRecognitionRef = useRef(null);
   const silenceTimerRef = useRef(null);
   const mockActionTimerRef = useRef(null);
@@ -138,7 +586,16 @@ Rules:
   const liveSetupPromiseRef = useRef(null);
   const livePendingGuidanceRef = useRef(null);
   const liveRequestCounterRef = useRef(0);
+  const readingTutorLiveSocketRef = useRef(null);
+  const readingTutorLiveSetupPromiseRef = useRef(null);
+  const readingTutorLivePendingRef = useRef(null);
+  const readingTutorLiveRequestCounterRef = useRef(0);
+  const spellingPracticeTimerRef = useRef(null);
+  const fireworksStopRef = useRef(null);
   const [liveLastEvent, setLiveLastEvent] = useState('Idle');
+
+  const landingFeatureCards = featureCards.filter((feature) => !hiddenLandingFeatureIds.has(feature.id));
+  const effectiveCloudConnections = getEffectiveCloudConnections(cloudConnections, cloudSessions);
 
 
   /// Firebase Authentication
@@ -158,34 +615,6 @@ Rules:
     return () => unsubscribe();
   }, []);
 
-
-  // voice recognition setup
-  useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.interimResults = false;
-      recognitionRef.current.lang = 'en-US'; 
-
-      recognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript.toLowerCase();
-        setLastTranscript(transcript);
-        setLastRecognitionState('Transcript received.');
-        void handleVoiceInput(transcript);
-        stopListening();
-      };
-
-      recognitionRef.current.onerror = (event) => {
-        setLastRecognitionState(`Recognition error: ${event.error || 'unknown'}`);
-        setIsListening(false);
-      };
-      recognitionRef.current.onend = () => {
-        setLastRecognitionState('Recognition ended.');
-        setIsListening(false);
-      };
-    }
-  }, [step, isConfirming, answers, view]);
 
   useEffect(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -281,38 +710,1553 @@ Rules:
     }
   }, [isMockMode, step]);
 
-  const startListening = () => {
-    if (isSpeaking) return;
+  useEffect(() => {
+    localStorage.setItem('journal_buddy_cloud_connections', JSON.stringify(cloudConnections));
+  }, [cloudConnections]);
 
-    if (mockResumeTimerRef.current) {
-      clearTimeout(mockResumeTimerRef.current);
-      mockResumeTimerRef.current = null;
+  useEffect(() => {
+    localStorage.setItem('journal_buddy_linked_resources', JSON.stringify(linkedResources));
+  }, [linkedResources]);
+
+  useEffect(() => {
+    setLinkedResources((prev) => prev.map(normalizeLinkedResource));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('journal_buddy_feature_custom_messages', JSON.stringify(featureCustomMessages));
+  }, [featureCustomMessages]);
+
+  useEffect(() => {
+    if (!spellingCache?.words?.length || !spellingCache.expiresAt || Date.now() > spellingCache.expiresAt) {
+      localStorage.removeItem(SPELLING_CACHE_KEY);
+      return;
     }
 
-    if (isMockMode && view !== 'journaling') {
-      setLastRecognitionState('Mock listening started.');
-      setIsListening(true);
+    localStorage.setItem(SPELLING_CACHE_KEY, JSON.stringify(spellingCache));
+  }, [spellingCache]);
+
+  useEffect(() => {
+    localStorage.setItem(SPELLING_HISTORY_KEY, JSON.stringify(spellingHistory));
+  }, [spellingHistory]);
+
+  useEffect(() => {
+    const writingMessage = (featureCustomMessages['writing-journal'] || '').trim();
+    if (writingMessage === customExpectation.trim()) return;
+    setCustomExpectation(writingMessage);
+  }, [featureCustomMessages, customExpectation]);
+
+  useEffect(() => {
+    if (selectedCustomizeFeature === 'writing-journal') {
+      setDraftFeatureCustomMessage(customExpectation);
+      return;
+    }
+
+    setDraftFeatureCustomMessage(featureCustomMessages[selectedCustomizeFeature] || '');
+  }, [selectedCustomizeFeature, featureCustomMessages, customExpectation]);
+
+  useEffect(() => {
+    sessionStorage.setItem('journal_buddy_cloud_sessions', JSON.stringify(cloudSessions));
+  }, [cloudSessions]);
+
+  useEffect(() => {
+    if (view !== 'setup' || !user?.uid || hasLoadedCloudStateRef.current) return;
+
+    let isMounted = true;
+    const loadCloudState = async () => {
+      try {
+        const cloudState = await loadCloudReferenceState({
+          db,
+          appId,
+          uid: user.uid,
+        });
+
+        if (!isMounted) return;
+        setCloudConnections(cloudState.connections);
+        setLinkedResources(dedupeLinkedResources((cloudState.references || []).map(normalizeLinkedResource)));
+        hasLoadedCloudStateRef.current = true;
+      } catch (error) {
+        console.error('Could not load cloud reference state from Firestore:', error);
+      } finally {
+        if (isMounted) setIsCloudStateReady(true);
+      }
+    };
+
+    loadCloudState();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [view, user?.uid]);
+
+  useEffect(() => {
+    if (view !== 'setup') return;
+
+    const providers = ['googleDrive', 'oneDrive'];
+    const nextConnections = { ...cloudConnections };
+    const nextSessions = { ...cloudSessions };
+    let hasChanges = false;
+
+    providers.forEach((provider) => {
+      if (!cloudConnections[provider]) return;
+      if (isCloudSessionValid(cloudSessions[provider])) return;
+      nextConnections[provider] = false;
+      nextSessions[provider] = null;
+      hasChanges = true;
+    });
+
+    if (!hasChanges) return;
+
+    setCloudConnections(nextConnections);
+    setCloudSessions(nextSessions);
+
+    if (user?.uid) {
+      saveCloudConnections({
+        db,
+        appId,
+        uid: user.uid,
+        connections: nextConnections,
+      }).catch((error) => {
+        console.error('Could not sync expired cloud connection state:', error);
+      });
+    }
+  }, [view, cloudConnections, cloudSessions, user?.uid]);
+
+  const referenceFeatureOptions = featureCards.map((feature) => ({
+    value: feature.id,
+    label: feature.title,
+  }));
+
+  const featureCustomizationOptions = featureCards.map((feature) => ({
+    value: feature.id,
+    label: feature.title,
+  }));
+
+  const selectedCustomizationCard = featureCards.find((feature) => feature.id === selectedCustomizeFeature);
+
+  const connectProvider = async (provider) => {
+    setCloudActionError('');
+    setIsCloudActionBusy(true);
+
+    try {
+      if (effectiveCloudConnections[provider]) {
+        setCloudConnections((prev) => ({ ...prev, [provider]: false }));
+        setCloudSessions((prev) => ({ ...prev, [provider]: null }));
+
+        if (user?.uid) {
+          const nextConnections = { ...cloudConnections, [provider]: false };
+          await saveCloudConnections({
+            db,
+            appId,
+            uid: user.uid,
+            connections: nextConnections,
+          });
+        }
+        return;
+      }
+
+      const session = provider === 'googleDrive'
+        ? await connectGoogleDrive()
+        : await connectOneDrive();
+
+      const nextConnections = { ...cloudConnections, [provider]: true };
+      setCloudSessions((prev) => ({ ...prev, [provider]: session }));
+      setCloudConnections(nextConnections);
+
+      if (user?.uid) {
+        await saveCloudConnections({
+          db,
+          appId,
+          uid: user.uid,
+          connections: nextConnections,
+        });
+      }
+    } catch (error) {
+      setCloudActionError(error.message || 'Could not connect provider.');
+    } finally {
+      setIsCloudActionBusy(false);
+    }
+  };
+
+  const loadCloudBrowserItems = async ({ provider, folderId = 'root', resetPath = false, folderName = 'Root' }) => {
+    const session = cloudSessions[provider];
+    if (!session?.accessToken) {
+      throw new Error('Cloud session is not available. Please reconnect.');
+    }
+
+    const items = provider === 'googleDrive'
+      ? await listGoogleDriveChildren({
+          accessToken: session.accessToken,
+          parentId: folderId,
+        })
+      : await listOneDriveChildren({
+          accessToken: session.accessToken,
+          parentId: folderId,
+        });
+
+    setCloudBrowser((prev) => {
+      const nextPath = resetPath
+        ? [{ id: 'root', name: 'Root' }]
+        : prev.path;
+
+      return {
+        ...prev,
+        provider,
+        items,
+        path: nextPath,
+        error: '',
+      };
+    });
+
+    if (!resetPath && folderId !== 'root') {
+      setCloudBrowser((prev) => {
+        const existing = prev.path.find((entry) => entry.id === folderId);
+        if (existing) {
+          const keepUntil = prev.path.findIndex((entry) => entry.id === folderId);
+          return { ...prev, path: prev.path.slice(0, keepUntil + 1) };
+        }
+        return { ...prev, path: [...prev.path, { id: folderId, name: folderName }] };
+      });
+    }
+  };
+
+  const openCloudBrowser = async () => {
+    setCloudActionError('');
+
+    const provider = linkDraft.provider;
+    if (!provider) {
+      setCloudActionError('Select a provider first.');
+      return;
+    }
+
+    if (!effectiveCloudConnections[provider] || !cloudSessions[provider]?.accessToken) {
+      setCloudActionError('Connect the selected provider before picking resources.');
+      return;
+    }
+
+    setCloudBrowser({
+      open: true,
+      provider,
+      isLoading: true,
+      error: '',
+      items: [],
+      path: [{ id: 'root', name: 'Root' }],
+    });
+
+    try {
+      await loadCloudBrowserItems({ provider, folderId: 'root', resetPath: true });
+    } catch (error) {
+      setCloudBrowser((prev) => ({
+        ...prev,
+        error: error.message || 'Could not load cloud resources.',
+      }));
+    } finally {
+      setCloudBrowser((prev) => ({ ...prev, isLoading: false }));
+    }
+  };
+
+  const closeCloudBrowser = () => {
+    setCloudBrowser((prev) => ({
+      ...prev,
+      open: false,
+      items: [],
+      error: '',
+      path: [{ id: 'root', name: 'Root' }],
+    }));
+  };
+
+  const enterCloudFolder = async (item) => {
+    if (!item || item.resourceType !== 'folder') return;
+
+    setCloudBrowser((prev) => ({ ...prev, isLoading: true, error: '' }));
+    try {
+      await loadCloudBrowserItems({
+        provider: cloudBrowser.provider,
+        folderId: item.id,
+        folderName: item.name,
+      });
+    } catch (error) {
+      setCloudBrowser((prev) => ({ ...prev, error: error.message || 'Could not open this folder.' }));
+    } finally {
+      setCloudBrowser((prev) => ({ ...prev, isLoading: false }));
+    }
+  };
+
+  const goToCloudFolderFromPath = async (folderId) => {
+    setCloudBrowser((prev) => ({ ...prev, isLoading: true, error: '' }));
+    try {
+      const selected = cloudBrowser.path.find((entry) => entry.id === folderId);
+      await loadCloudBrowserItems({
+        provider: cloudBrowser.provider,
+        folderId,
+        folderName: selected?.name || 'Folder',
+      });
+    } catch (error) {
+      setCloudBrowser((prev) => ({ ...prev, error: error.message || 'Could not open this folder.' }));
+    } finally {
+      setCloudBrowser((prev) => ({ ...prev, isLoading: false }));
+    }
+  };
+
+  const selectCloudResource = (item) => {
+    if (!item) return;
+
+    const destinationUrl = item.webUrl || '';
+    if (!destinationUrl) {
+      setCloudActionError('Could not determine a destination URL for this resource.');
+      return;
+    }
+
+    setLinkDraft((prev) => ({
+      ...prev,
+      provider: cloudBrowser.provider,
+      target: destinationUrl,
+      selectedName: item.name || prev.selectedName,
+      selectedType: item.resourceType || prev.selectedType,
+      sourceId: item.id || prev.sourceId,
+      selectedMimeType: item.mimeType || prev.selectedMimeType,
+      selectedModifiedTime: item.modifiedTime || prev.selectedModifiedTime,
+    }));
+
+    closeCloudBrowser();
+  };
+
+  const updateLinkDraft = (field, value) => {
+    setLinkDraft((prev) => {
+      if (field === 'provider' && prev.provider !== value) {
+        return {
+          ...prev,
+          provider: value,
+          target: '',
+          selectedName: '',
+          selectedType: '',
+          sourceId: '',
+          selectedMimeType: '',
+          selectedModifiedTime: '',
+        };
+      }
+
+      return { ...prev, [field]: value };
+    });
+  };
+
+  const addReferenceLink = () => {
+    const providerConnected = effectiveCloudConnections[linkDraft.provider];
+    if (!providerConnected) return;
+
+    const target = linkDraft.target.trim();
+    const normalizedFeature = normalizeFeatureId(linkDraft.feature);
+    if (!target || !normalizedFeature) return;
+
+    const duplicateKey = createLinkedResourceDedupKey({
+      provider: linkDraft.provider,
+      feature: normalizedFeature,
+      sourceId: linkDraft.sourceId || '',
+      target,
+    });
+    const duplicateExists = linkedResources.some((resource) => createLinkedResourceDedupKey(resource) === duplicateKey);
+    if (duplicateExists) {
+      setCloudActionError('This document is already linked for this feature.');
+      return;
+    }
+
+    const nextResource = {
+      id: `resource_${Date.now()}`,
+      provider: linkDraft.provider,
+      feature: normalizedFeature,
+      resourceType: linkDraft.selectedType || 'file',
+      label: linkDraft.selectedName || 'Linked reference',
+      target,
+      sourceId: linkDraft.sourceId || '',
+      mimeType: linkDraft.selectedMimeType || '',
+      modifiedTime: linkDraft.selectedModifiedTime || '',
+      derivedWords: [],
+      createdAtIso: new Date().toISOString(),
+    };
+
+    setLinkedResources((prev) => dedupeLinkedResources([nextResource, ...prev]));
+
+    if (user?.uid) {
+      saveCloudReference({
+        db,
+        appId,
+        uid: user.uid,
+        reference: nextResource,
+      }).catch((error) => {
+        console.error('Could not save linked cloud reference:', error);
+        setLinkedResources((prev) => prev.filter((resource) => resource.id !== nextResource.id));
+      });
+    }
+
+    setLinkDraft({
+      provider: linkDraft.provider,
+      feature: '',
+      target: '',
+      selectedName: '',
+      selectedType: '',
+      sourceId: '',
+      selectedMimeType: '',
+      selectedModifiedTime: '',
+    });
+  };
+
+  const getFeatureReferences = (featureId) => {
+    const canonical = normalizeFeatureId(featureId);
+    return dedupeLinkedResources(linkedResources).filter((resource) => normalizeFeatureId(resource.feature) === canonical);
+  };
+
+  const launchCelebration = async () => {
+    try {
+      const { Fireworks } = await import('fireworks-js');
+      const container = document.createElement('div');
+      container.style.position = 'fixed';
+      container.style.inset = '0';
+      container.style.pointerEvents = 'none';
+      container.style.zIndex = '9999';
+      document.body.appendChild(container);
+
+      const fireworks = new Fireworks(container, {
+        opacity: 0.6,
+        acceleration: 1.04,
+        friction: 0.95,
+        gravity: 1.4,
+        particles: 70,
+        explosion: 6,
+      });
+
+      fireworks.start();
+      fireworksStopRef.current = () => {
+        fireworks.stop();
+        try {
+          container.remove();
+        } catch {
+          // no-op
+        }
+      };
+
+      window.setTimeout(() => {
+        fireworksStopRef.current?.();
+        fireworksStopRef.current = null;
+      }, 3200);
+    } catch (error) {
+      console.error('Fireworks launch failed:', error);
+    }
+  };
+
+  const updateFeatureWordBankState = (featureId, patch) => {
+    setFeatureWordBanks((prev) => ({
+      ...prev,
+      [featureId]: {
+        ...(prev[featureId] || { words: [], isLoading: false, error: '', loadedAtIso: '' }),
+        ...patch,
+      },
+    }));
+  };
+
+  const loadFeatureWordBankState = async (featureId) => {
+    if (!user?.uid) {
+      updateFeatureWordBankState(featureId, {
+        words: [],
+        isLoading: false,
+        error: 'Sign-in is required before loading saved words.',
+      });
+      return [];
+    }
+
+    updateFeatureWordBankState(featureId, { isLoading: true, error: '' });
+
+    try {
+      const words = await loadFeatureWordBank({
+        db,
+        appId,
+        uid: user.uid,
+        featureId,
+      });
+
+      updateFeatureWordBankState(featureId, {
+        words,
+        isLoading: false,
+        error: '',
+        loadedAtIso: new Date().toISOString(),
+      });
+      return words;
+    } catch (error) {
+      updateFeatureWordBankState(featureId, {
+        words: [],
+        isLoading: false,
+        error: error.message || 'Could not load saved words.',
+      });
+      return [];
+    }
+  };
+
+  const upsertFeatureWordBankEntry = async ({ featureId, word, reviewFrequency = 1 }) => {
+    if (!user?.uid) return;
+
+    try {
+      await upsertFeatureWord({
+        db,
+        appId,
+        uid: user.uid,
+        featureId,
+        word,
+        reviewFrequency: Math.min(5, Math.max(1, Number(reviewFrequency || 1))),
+      });
+
+      await loadFeatureWordBankState(featureId);
+    } catch (error) {
+      const message = error?.message || '';
+      if (message.includes('Missing or insufficient permissions')) {
+        updateFeatureWordBankState(featureId, { error: 'Could not save to Firebase word bank due to permissions. Words are kept locally for this session.' });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  const removeFeatureWordBankEntry = async ({ featureId, word }) => {
+    if (!user?.uid) return;
+
+    try {
+      await removeFeatureWord({
+        db,
+        appId,
+        uid: user.uid,
+        featureId,
+        word,
+      });
+
+      await loadFeatureWordBankState(featureId);
+    } catch (error) {
+      const message = error?.message || '';
+      if (message.includes('Missing or insufficient permissions')) {
+        updateFeatureWordBankState(featureId, { error: 'Could not update Firebase word bank due to permissions.' });
+        return;
+      }
+      throw error;
+    }
+  };
+
+  const loadCloudWordsToFeatureBank = async (featureId) => {
+    const references = getFeatureReferences(featureId);
+    let extractedWords = [];
+    if (references.length === 0) {
+      updateFeatureWordBankState(featureId, {
+        error: 'No linked cloud references yet. Add one in Settings first.',
+      });
+      return;
+    }
+
+    updateFeatureWordBankState(featureId, { isLoading: true, error: '' });
+
+    try {
+      const { words, warnings } = await loadWordsFromLinkedReferences({
+        references,
+        cloudSessions,
+        maxWords: 500,
+      });
+      extractedWords = words;
+
+      if (!words.length) {
+        updateFeatureWordBankState(featureId, {
+          isLoading: false,
+          error: warnings?.[0] || 'No words found from linked references.',
+        });
+        return;
+      }
+
+      if (!user?.uid) {
+        throw new Error('Sign-in is required before uploading words to Firebase.');
+      }
+
+      await upsertFeatureWords({
+        db,
+        appId,
+        uid: user.uid,
+        featureId,
+        words,
+      });
+
+      // For upload-driven features, drop temporary extraction cache once words are persisted.
+      clearWordsCacheForReferences(references);
+
+      await loadFeatureWordBankState(featureId);
+      setFeatureActionMessage('Words uploaded successfully. Great job!');
+    } catch (error) {
+      const message = error?.message || '';
+      if (message.includes('Missing or insufficient permissions')) {
+        updateFeatureWordBankState(featureId, {
+          words: extractedWords.map((word) => ({ word, reviewFrequency: 1 })),
+          isLoading: false,
+          error: '',
+          loadedAtIso: new Date().toISOString(),
+        });
+        setFeatureActionMessage('Words loaded, but Firebase permissions blocked saving. You can still practice in this session.');
+        return;
+      }
+
+      updateFeatureWordBankState(featureId, {
+        isLoading: false,
+        error: error.message || 'Could not upload words from linked references.',
+      });
+    }
+  };
+
+  const startFeaturePracticeSession = async (featureId) => {
+    const loaded = await loadFeatureWordBankState(featureId);
+    const allWords = loaded
+      .map((item) => ({ word: item.word, reviewFrequency: Math.min(5, Math.max(1, Number(item.reviewFrequency || 1))) }))
+      .filter((item) => item.word);
+
+    const mockToday = isLocal ? localStorage.getItem('journal_buddy_mock_today') || '' : '';
+    const practiceDate = resolvePracticeDate(mockToday);
+    const words = pickLeitnerWordsForToday(allWords, practiceDate);
+
+    if (!words.length) {
+      setFeatureActionMessage('No words are scheduled for today based on Leitner boxes. Try again on the next review day.');
+      return;
+    }
+
+    setFeaturePracticeSession({
+      active: true,
+      featureId,
+      index: 0,
+      words,
+      feedback: '',
+      finished: false,
+    });
+
+    setFeatureActionMessage('Say the shown word. You can also say "i do not know" or "skip" to move on.');
+    stopListening();
+    window.setTimeout(() => startListening(), 250);
+  };
+
+  const stopFeaturePracticeSession = () => {
+    setFeaturePracticeSession({
+      active: false,
+      featureId: '',
+      index: 0,
+      words: [],
+      feedback: '',
+      finished: false,
+    });
+    stopSpeaking();
+    stopListening();
+  };
+
+  const loadSpellingWordsToCache = async () => {
+    const featureId = 'spelling-champion';
+    const references = getFeatureReferences(featureId);
+
+    if (references.length === 0) {
+      setFeatureActionMessage('No linked references yet. Go to Settings and link one first.');
+      return { ok: false };
+    }
+
+    updateCloudWordBank(featureId, { isLoading: true, error: '' });
+
+    try {
+      const { words, warnings } = await loadWordsFromLinkedReferences({
+        references,
+        cloudSessions,
+        maxWords: 500,
+      });
+
+      const cleanWords = [...new Set(words.map((word) => normalizeWordToken(word)).filter((word) => /^[a-z][a-z'\-]{1,}$/.test(word)))];
+      if (!cleanWords.length) {
+        updateCloudWordBank(featureId, {
+          words: [],
+          isLoading: false,
+          error: 'No usable spelling words found in linked references.',
+          loadedAtIso: '',
+        });
+        return { ok: false };
+      }
+
+      const nextCache = {
+        words: cleanWords,
+        expiresAt: Date.now() + SPELLING_CACHE_TTL_MS,
+      };
+      setSpellingCache(nextCache);
+
+      updateCloudWordBank(featureId, {
+        words: cleanWords,
+        isLoading: false,
+        error: warnings.length ? `Loaded with warnings: ${warnings[0]}` : '',
+        loadedAtIso: new Date().toISOString(),
+      });
+
+      setFeatureActionMessage('Spelling words loaded and cached for 7 days.');
+      return { ok: true };
+    } catch (error) {
+      updateCloudWordBank(featureId, {
+        words: [],
+        isLoading: false,
+        error: error.message || 'Could not load spelling words.',
+      });
+      return { ok: false };
+    }
+  };
+
+  const startSpellingPracticeLoop = () => {
+    if (!spellingCache.words.length) return;
+    setSpellingPracticeState({ open: true, index: 0 });
+  };
+
+  const stopSpellingPracticeLoop = () => {
+    if (spellingPracticeTimerRef.current) {
+      window.clearInterval(spellingPracticeTimerRef.current);
+      spellingPracticeTimerRef.current = null;
+    }
+    stopSpeaking();
+    setSpellingPracticeState({ open: false, index: 0 });
+  };
+
+  const startSpellingQuiz = () => {
+    if (!spellingCache.words.length) return;
+
+    const questionWords = shuffled(spellingCache.words).slice(0, 10);
+    setSpellingQuizState({
+      open: true,
+      index: 0,
+      words: questionWords,
+      answer: '',
+      score: 0,
+      feedback: '',
+      awaitingVoiceAnswer: false,
+    });
+
+    const firstWord = questionWords[0] || '';
+    if (firstWord) {
+      speakText(`Spell this word: ${firstWord}`);
+    }
+  };
+
+  const closeSpellingQuiz = () => {
+    setSpellingQuizState({
+      open: false,
+      index: 0,
+      words: [],
+      answer: '',
+      score: 0,
+      feedback: '',
+      awaitingVoiceAnswer: false,
+    });
+  };
+
+  const submitSpellingQuizAnswer = async () => {
+    if (!spellingQuizState.open) return;
+    const currentWord = spellingQuizState.words[spellingQuizState.index] || '';
+    if (!currentWord) return;
+
+    const answer = normalizeWordToken(spellingQuizState.answer);
+    const correctWord = normalizeWordToken(currentWord);
+    const isCorrect = answer === correctWord;
+    const nextScore = spellingQuizState.score + (isCorrect ? 1 : 0);
+    const feedbackMessage = isCorrect ? 'Correct!' : `Not quite. Correct answer: ${currentWord}`;
+
+    setSpellingQuizState((prev) => ({
+      ...prev,
+      feedback: feedbackMessage,
+    }));
+
+    if (!isCorrect) {
+      const aiHint = await getSpellingCoachHint({
+        word: currentWord,
+        attemptedAnswer: spellingQuizState.answer,
+      });
+      await speakText(`${aiHint} The correct spelling is ${spellOutWordNaturally(currentWord)}.`);
+    }
+
+    const nextIndex = spellingQuizState.index + 1;
+    if (nextIndex >= spellingQuizState.words.length) {
+      setSpellingHistory((prev) => {
+        const recent = [...prev, {
+          dateIso: new Date().toISOString(),
+          score: nextScore,
+          total: spellingQuizState.words.length,
+        }].filter((item) => Date.now() - new Date(item.dateIso).getTime() <= 30 * 24 * 60 * 60 * 1000);
+        return recent;
+      });
+
+      closeSpellingQuiz();
+      await launchCelebration();
+      await speakText('Awesome effort! You did a great job today!');
+      return;
+    }
+
+    const nextWord = spellingQuizState.words[nextIndex];
+    setSpellingQuizState((prev) => ({
+      ...prev,
+      index: nextIndex,
+      score: nextScore,
+      feedback: feedbackMessage,
+      answer: '',
+      awaitingVoiceAnswer: false,
+    }));
+
+    if (nextWord) {
+      await speakText(`Next word: ${nextWord}`);
+    }
+  };
+
+  const repeatCurrentSpellingQuestion = async () => {
+    const currentWord = spellingQuizState.words[spellingQuizState.index] || '';
+    if (!currentWord) return;
+    await speakText(`Please spell: ${currentWord}`);
+  };
+
+  const updateCloudWordBank = (featureId, patch) => {
+    setCloudWordBanks((prev) => ({
+      ...prev,
+      [featureId]: {
+        ...(prev[featureId] || { words: [], isLoading: false, error: '', loadedAtIso: '' }),
+        ...patch,
+      },
+    }));
+  };
+
+  const parseDataUrlInlineData = (dataUrl = '') => {
+    const matched = String(dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
+    if (!matched) return null;
+    return {
+      mimeType: matched[1],
+      data: matched[2],
+    };
+  };
+
+  const arrayBufferToBase64 = (arrayBuffer) => {
+    const bytes = new Uint8Array(arrayBuffer || new ArrayBuffer(0));
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  };
+
+  const generateReadingTutorIllustration = async ({ storyText, title, worksheetImageDataUrl = '' }) => {
+    const worksheetInlineImage = parseDataUrlInlineData(worksheetImageDataUrl);
+    if (!storyText.trim() && !worksheetInlineImage) {
+      setReadingTutorIllustrationUrl('');
+      setReadingTutorImageStatus('idle');
+      return;
+    }
+
+    if (!googleAIKey) {
+      if (worksheetImageDataUrl) {
+        setReadingTutorIllustrationUrl(worksheetImageDataUrl);
+        setReadingTutorImageStatus('ready');
+      } else {
+        setReadingTutorImageStatus('idle');
+      }
+      return;
+    }
+
+    setReadingTutorImageStatus('loading');
+
+    const stylePrompt = `You are creating a bright and friendly 3D Disney-style image for a child's reading app.
+Title: ${title || 'Reading Story'}
+Story context: ${storyText || 'N/A'}
+If an input worksheet image is provided, preserve the core scene objects and composition while polishing into colorful kid-friendly art.
+Output: one final image only.`;
+
+    const modelCandidates = [
+      'gemini-2.0-flash-preview-image-generation',
+      'gemini-2.5-flash-image-preview',
+    ];
+
+    for (const modelName of modelCandidates) {
+      try {
+        const parts = worksheetInlineImage
+          ? [{ text: stylePrompt }, { inlineData: worksheetInlineImage }]
+          : [{ text: stylePrompt }];
+
+        const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${googleAIKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts }],
+            generationConfig: {
+              responseModalities: ['TEXT', 'IMAGE'],
+            },
+          }),
+        });
+
+        const result = await response.json();
+        const imagePart = result?.candidates?.[0]?.content?.parts?.find((part) => part?.inlineData?.data);
+        if (!imagePart?.inlineData?.data) continue;
+
+        setReadingTutorIllustrationUrl(`data:${imagePart.inlineData.mimeType || 'image/png'};base64,${imagePart.inlineData.data}`);
+        setReadingTutorImageStatus('ready');
+        return;
+      } catch (error) {
+        console.warn(`[ReadingTutor] illustration generation failed with ${modelName}:`, error?.message || error);
+      }
+    }
+
+    if (worksheetImageDataUrl) {
+      setReadingTutorIllustrationUrl(worksheetImageDataUrl);
+      setReadingTutorImageStatus('ready');
+      return;
+    }
+
+    console.error('Reading tutor illustration generation failed: no supported image model returned output.');
+    setReadingTutorIllustrationUrl('');
+    setReadingTutorImageStatus('error');
+  };
+
+  const speakReadingTutorHint = async (hint, keyword = '') => {
+    const fallback = hint || `Let's go on a word hunt. Can you find ${keyword}?`;
+    if (!googleAIKey) {
+      await speakText(fallback);
       return;
     }
 
     try {
-      setLastRecognitionState('Starting browser speech recognition.');
-      recognitionRef.current?.start();
-      setIsListening(true);
-    } catch (e) {
-      // avoid redundant errors if start is called multiple times
-      setLastRecognitionState('Could not start browser speech recognition.');
-      setIsListening(false);
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: fallback }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Kore' },
+              },
+            },
+          },
+        }),
+      });
+
+      const result = await response.json();
+      const audioPart = result?.candidates?.[0]?.content?.parts?.find((part) => part?.inlineData?.data);
+      if (!audioPart?.inlineData?.data) {
+        await speakText(fallback);
+        return;
+      }
+
+      const ttsAudio = new Audio(`data:${audioPart.inlineData.mimeType || 'audio/wav'};base64,${audioPart.inlineData.data}`);
+      await ttsAudio.play();
+    } catch {
+      await speakText(fallback);
     }
   };
 
-  const stopListening = () => {
-    setLastRecognitionState('Stopped listening.');
-    setIsListening(false);
+  const parseWorksheetWithGemini = async ({ rawText, sourceFile, mode = 'week-day', targetWeek, targetDay, targetStoryNumber }) => {
+    if (!googleAIKey) return null;
+
+    const safeWeek = Math.max(1, Number(targetWeek || 1));
+    const safeDay = Math.max(1, Number(targetDay || 1));
+    const safeStoryNumber = Math.max(1, Number(targetStoryNumber || 1));
+    const isStoryMode = mode === 'story-number';
+    const weekDayPattern = /week\s*(\d{1,2})[^\d]{0,20}day\s*(\d)/i;
+    const questionLabels = ['A', 'B', 'C', 'D'];
+
+    const systemPrompt = isStoryMode
+      ? `You are an expert reading teacher for Daily Reading Comprehension Grade 1.
+Find ONLY the lesson for TARGET Story ${safeStoryNumber} (mapped from today's date).
+
+Hard constraints:
+- Prioritize explicit story numbering and student worksheet content.
+- Ignore index, cover, teacher-guide, and "What's in This Book" pages.
+- Do not return another story number.
+- If target is not found, return an empty story and empty questions.
+- Return JSON only.`
+      : `You are an expert reading teacher for Daily Reading Comprehension Grade 1.
+Find ONLY the lesson for TARGET Week ${safeWeek}, Day ${safeDay}.
+
+Hard constraints:
+- Prioritize page header markers (Week/Day on worksheet page) over index, cover, teacher-guide, or "What's in This Book" pages.
+- Do not return a different week/day.
+- If target is not found, return an empty story and empty questions.
+- Return JSON only.`;
+
+    const userQuery = isStoryMode
+      ? `Provide lesson for Story ${safeStoryNumber} from the uploaded worksheet document.`
+      : `Provide lesson for Week ${safeWeek}, Day ${safeDay} from the uploaded worksheet document.`;
+
+    const promptParts = [{ text: userQuery }];
+    if (sourceFile?.arrayBuffer && sourceFile?.mimeType) {
+      promptParts.unshift({
+        inlineData: {
+          mimeType: sourceFile.mimeType,
+          data: arrayBufferToBase64(sourceFile.arrayBuffer),
+        },
+      });
+    }
+
+    if (String(rawText || '').trim()) {
+      promptParts.push({
+        text: `Optional extracted text context:\n${String(rawText || '').slice(0, 50000)}`,
+      });
+    }
+
+    const requestBody = {
+      contents: [{ parts: promptParts }],
+      systemInstruction: {
+        parts: [{ text: systemPrompt }],
+      },
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: isStoryMode
+          ? {
+              type: 'object',
+              properties: {
+                story_number: { type: 'number' },
+                skill: { type: 'string' },
+                title: { type: 'string' },
+                story: { type: 'string' },
+                questions: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      q: { type: 'string' },
+                      a: { type: 'array', items: { type: 'string' } },
+                    },
+                    required: ['q', 'a'],
+                  },
+                },
+                sightWords: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['story_number', 'skill', 'title', 'story', 'questions', 'sightWords'],
+            }
+          : {
+              type: 'object',
+              properties: {
+                week_day: { type: 'string' },
+                skill: { type: 'string' },
+                title: { type: 'string' },
+                story: { type: 'string' },
+                questions: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      q: { type: 'string' },
+                      a: { type: 'array', items: { type: 'string' } },
+                    },
+                    required: ['q', 'a'],
+                  },
+                },
+                sightWords: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['week_day', 'skill', 'title', 'story', 'questions', 'sightWords'],
+            },
+      },
+    };
+
+    const modelCandidates = [
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'gemini-1.5-flash',
+    ];
+    const maxRetries = 3;
+
+    for (const modelName of modelCandidates) {
+      for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+        try {
+          const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${googleAIKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody),
+          });
+
+          const result = await response.json();
+          const raw = (result?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+          if (!raw) throw new Error('Empty response from AI');
+
+          const parsed = JSON.parse(raw);
+          if (isStoryMode) {
+            const matchedStory = Math.max(1, Number(parsed?.story_number || 0));
+            if (matchedStory !== safeStoryNumber) {
+              throw new Error(`Mismatched target story number: got Story ${matchedStory}`);
+            }
+          } else {
+            const weekDayValue = String(parsed?.week_day || '').trim();
+            const weekDayMatch = weekDayPattern.exec(weekDayValue);
+            if (!weekDayMatch) throw new Error('Missing week/day in response');
+
+            const matchedWeek = Number(weekDayMatch[1] || 0);
+            const matchedDay = Number(weekDayMatch[2] || 0);
+            if (matchedWeek !== safeWeek || matchedDay !== safeDay) {
+              throw new Error(`Mismatched target week/day: got Week ${matchedWeek} Day ${matchedDay}`);
+            }
+          }
+
+          const story = String(parsed?.story || '').trim();
+          const rawQuestions = Array.isArray(parsed?.questions) ? parsed.questions : [];
+          const questions = rawQuestions.slice(0, 3).map((item, idx) => {
+            const choices = (Array.isArray(item?.a) ? item.a : [])
+              .slice(0, 4)
+              .map((choice, choiceIdx) => ({
+                label: questionLabels[choiceIdx],
+                text: String(choice || '').trim(),
+              }))
+              .filter((choice) => choice.text);
+
+            return {
+              id: `q-${idx + 1}`,
+              questionNumber: idx + 1,
+              stem: String(item?.q || '').trim(),
+              options: choices,
+              correctOptionLabel: null,
+            };
+          }).filter((q) => q.stem && q.options.length > 0);
+
+          if (!story || questions.length === 0) {
+            throw new Error('Target lesson incomplete');
+          }
+
+          const title = isStoryMode
+            ? (String(parsed?.title || parsed?.skill || `Story ${safeStoryNumber}`).trim() || `Story ${safeStoryNumber}`)
+            : (String(parsed?.title || parsed?.skill || `Week ${safeWeek} Day ${safeDay}`).trim() || `Week ${safeWeek} Day ${safeDay}`);
+          const unit = {
+            key: `week-${isStoryMode ? safeStoryNumber : safeWeek}-day-${isStoryMode ? 1 : safeDay}`,
+            weekNumber: isStoryMode ? safeStoryNumber : safeWeek,
+            dayNumber: isStoryMode ? 1 : safeDay,
+            title,
+            story,
+            questions,
+          };
+
+          return {
+            units: [unit],
+            byWeekDay: { [unit.key]: unit },
+            warnings: [],
+          };
+        } catch (error) {
+          const message = String(error?.message || '').toLowerCase();
+          const isModelNotFound = message.includes('404') || message.includes('not found for api version');
+          if (isModelNotFound) {
+            break;
+          }
+          if (attempt < maxRetries - 1) {
+            await delay(Math.pow(2, attempt + 1) * 1000);
+          }
+        }
+      }
+    }
+
+    return null;
+  };
+
+  const evaluateReadingTutorChoice = async ({ story, questionStem, options, selectedLabel }) => {
+    const fallback = selectedLabel === 'A';
+    if (!googleAIKey) return fallback;
+
+    const optionsText = (options || []).map((option) => `${option.label}. ${option.text}`).join('\n');
+    const prompt = `Read this story and question, then determine whether the selected option is correct.
+Return JSON only: {"isCorrect": boolean}
+
+Story:
+${story}
+
+Question:
+${questionStem}
+
+Options:
+${optionsText}
+
+Selected option: ${selectedLabel}`;
 
     try {
-      recognitionRef.current?.stop();
-    } catch (e) {}
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
+
+      const result = await response.json();
+      const raw = (result?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      return Boolean(parsed?.isCorrect);
+    } catch {
+      return fallback;
+    }
+  };
+
+  const resetReadingTutorRun = () => {
+    setReadingTutorQuestionIndex(0);
+    setReadingTutorScore(0);
+    setReadingTutorAnswers({});
+    setReadingTutorHighlightTerms([]);
+    setReadingTutorCelebrating(false);
+    setReadingTutorFeedback('');
+    setReadingTutorUnfamiliarWords([]);
+    setReadingTutorWordReviewInProgress(false);
+    setReadingTutorWordReviewCompleted(false);
+    setReadingTutorReviewWordIndex(0);
+    setReadingTutorReadingDoneSignal(0);
+    setReadingTutorDiscussionQuestion('');
+    setReadingTutorDiscussionTurns(0);
+    setReadingTutorDiscussionDone(false);
+  };
+
+  const normalizeUnfamiliarWord = (value = '') => String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z'-]/g, '')
+    .trim();
+
+  const handleReadingTutorStoryWordTap = async (word) => {
+    const normalized = normalizeUnfamiliarWord(word);
+    if (!normalized) return;
+
+    setReadingTutorUnfamiliarWords((prev) => (prev.includes(normalized) ? prev : [...prev, normalized]));
+    await speakText(normalized, { rate: 0.78 });
+  };
+
+  const getStoryDiscussionFollowup = async ({ story, childAnswer, turns }) => {
+    const fallback = {
+      nextQuestion: turns >= 1 ? '' : 'Can you tell me one important thing that happened in the story?',
+      confidence: turns >= 1 ? 0.9 : 0.55,
+      encourageReadingLog: turns >= 1,
+    };
+    if (!googleAIKey) return fallback;
+
+    const prompt = `You are a gentle Grade 1 reading coach.
+Story:\n${story}
+Child response:\n${childAnswer}
+Current turn: ${turns}
+
+Return JSON only:
+{
+  "nextQuestion": string,
+  "confidence": number,
+  "encourageReadingLog": boolean
+}
+
+Rules:
+- confidence range 0..1
+- if confidence >= 0.75, nextQuestion should be empty
+- ask only one short follow-up question when needed`;
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json' },
+        }),
+      });
+      const result = await response.json();
+      const raw = (result?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      return {
+        nextQuestion: String(parsed?.nextQuestion || '').trim(),
+        confidence: Math.max(0, Math.min(1, Number(parsed?.confidence || 0))),
+        encourageReadingLog: Boolean(parsed?.encourageReadingLog),
+      };
+    } catch {
+      return fallback;
+    }
+  };
+
+  const shouldAutoFinalizeReading = async ({ transcriptBuffer, latestText }) => {
+    const latest = String(latestText || '').trim();
+    const combined = String(transcriptBuffer || '').trim();
+    if (!latest || !combined) return false;
+
+    const explicitEnding = /\b(the end|finally|in the end|that was|all done|done reading)\b/i.test(latest);
+    if (explicitEnding) return true;
+
+    const words = combined.split(/\s+/).filter(Boolean);
+    if (words.length < 35) return false;
+    if (!googleAIKey) return words.length >= 70;
+
+    const prompt = `You are detecting if a child has likely finished reading a passage aloud.
+Return JSON only: {"isDone": boolean}
+
+Transcript so far:\n${combined.slice(-2400)}
+Latest utterance:\n${latest}`;
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json' },
+        }),
+      });
+      const result = await response.json();
+      const raw = (result?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      if (!raw) return false;
+      const parsed = JSON.parse(raw);
+      return Boolean(parsed?.isDone);
+    } catch {
+      return words.length >= 70;
+    }
+  };
+
+  const startReadingTutorWordReview = async () => {
+    if (readingTutorWordReviewInProgress) return;
+
+    const words = [...new Set(readingTutorUnfamiliarWords.map(normalizeUnfamiliarWord).filter(Boolean))];
+    if (words.length === 0) {
+      setReadingTutorWordReviewCompleted(true);
+      setReadingTutorWordReviewInProgress(false);
+      setReadingTutorFeedback('Great reading. No unfamiliar words were selected today.');
+      if (readingPracticeFeatureId === 'story-a-day') {
+        const firstQuestion = 'Nice work. What is this story mostly about?';
+        setReadingTutorDiscussionQuestion(firstQuestion);
+        setReadingTutorDiscussionTurns(0);
+        setReadingTutorDiscussionDone(false);
+        await speakText(firstQuestion);
+      }
+      return;
+    }
+
+    setReadingTutorReviewWordIndex(0);
+    setReadingTutorWordReviewInProgress(true);
+    setReadingTutorWordReviewCompleted(false);
+    setReadingTutorFeedback('Let us practice together. Listen and then say the word clearly.');
+    await speakText(`Great. First word: ${words[0]}. Please say ${words[0]}.`, { rate: 0.92 });
+  };
+
+  const completeReadingTutorWordReview = async () => {
+    const words = [...new Set(readingTutorUnfamiliarWords.map(normalizeUnfamiliarWord).filter(Boolean))];
+    if (user?.uid && words.length) {
+      try {
+        await upsertFeatureWords({
+          db,
+          appId,
+          uid: user.uid,
+          featureId: 'sightwords-master',
+          words,
+        });
+        await loadFeatureWordBankState('sightwords-master');
+      } catch (error) {
+        console.error('Could not sync unfamiliar words to sight words bank:', error);
+      }
+    }
+
+    setReadingTutorWordReviewCompleted(true);
+    setReadingTutorWordReviewInProgress(false);
+
+    if (readingPracticeFeatureId === 'story-a-day') {
+      const firstQuestion = 'Great word practice. What is this story mostly about?';
+      setReadingTutorDiscussionQuestion(firstQuestion);
+      setReadingTutorDiscussionTurns(0);
+      setReadingTutorDiscussionDone(false);
+      setReadingTutorFeedback('Now let us discuss the story.');
+      await speakText(firstQuestion);
+      return;
+    }
+
+    setReadingTutorFeedback('Word review complete. Nice job! You can move to the questions now.');
+    await speakText('Word review complete. Nice job!');
+  };
+
+  const applyReadingTutorWeekDay = (weekNumber, dayNumber, worksheetData = readingTutorWorksheetData) => {
+    const safeWeek = Math.max(1, Math.min(52, Number(weekNumber || 1)));
+    const safeDay = Math.max(1, Math.min(5, Number(dayNumber || 1)));
+    const nextUnit = getWorksheetUnitForDate({
+      worksheetData,
+      weekNumber: safeWeek,
+      dayNumber: safeDay,
+    });
+
+    setReadingTutorWeekNumber(safeWeek);
+    setReadingTutorDayNumber(safeDay);
+    setReadingTutorActiveUnit(nextUnit);
+    resetReadingTutorRun();
+
+    setReadingTutorIllustrationUrl('');
+    setReadingTutorImageStatus('idle');
+  };
+
+  const loadReadingTutorWorksheet = async () => {
+    const featureId = readingPracticeFeatureId || 'reading-tutor';
+    const references = getFeatureReferences(featureId);
+    if (references.length === 0) {
+      setReadingTutorFeedback('Add a worksheet file in Settings before starting Reading Tutor.');
+      setReadingTutorWorksheetData({ units: [], byWeekDay: {}, warnings: ['No linked worksheet references found.'] });
+      setReadingTutorActiveUnit(null);
+      return;
+    }
+
+    updateCloudWordBank(featureId, {
+      isLoading: true,
+      error: '',
+    });
+
+    try {
+      const currentDate = new Date();
+      const isStoryMode = featureId === 'story-a-day';
+      const weekNumber = featureId === 'story-a-day'
+        ? Math.max(1, Math.min(31, currentDate.getDate()))
+        : getSchoolWeekNumber(currentDate);
+      const dayNumber = featureId === 'story-a-day'
+        ? 1
+        : getSchoolDayNumber(currentDate);
+
+      const targeted = isStoryMode
+        ? { text: '', warnings: [] }
+        : await loadWorksheetTargetTextFromLinkedReferences({
+            references,
+            cloudSessions,
+            weekNumber,
+            dayNumber,
+          });
+
+      const extracted = await loadWorksheetTextFromLinkedReferences({
+        references,
+        cloudSessions,
+      });
+      const worksheetSourceFile = await loadWorksheetSourceFileFromLinkedReferences({
+        references,
+        cloudSessions,
+      });
+      const focusedWorksheetText = isStoryMode
+        ? (extracted.text || targeted.text)
+        : (extractWorksheetSectionForWeekDay({
+            text: targeted.text || extracted.text,
+            weekNumber,
+            dayNumber,
+          }) || targeted.text || extracted.text);
+
+      const geminiWorksheet = await parseWorksheetWithGemini({
+        rawText: focusedWorksheetText,
+        sourceFile: worksheetSourceFile,
+        mode: isStoryMode ? 'story-number' : 'week-day',
+        targetWeek: weekNumber,
+        targetDay: dayNumber,
+        targetStoryNumber: isStoryMode ? weekNumber : undefined,
+      });
+      const worksheetData = geminiWorksheet || parseWorksheetDocument(focusedWorksheetText, {
+        targetWeek: weekNumber,
+        targetDay: dayNumber,
+      });
+
+      setReadingTutorWorksheetData({
+        units: worksheetData.units,
+        byWeekDay: worksheetData.byWeekDay,
+        warnings: [...(worksheetData.warnings || []), ...(targeted.warnings || []), ...extracted.warnings],
+      });
+
+      const firstUnit = getWorksheetUnitForDate({ worksheetData, weekNumber, dayNumber });
+      const normalizedUnit = firstUnit
+        ? {
+            ...firstUnit,
+            title: String(firstUnit.title || `Week ${weekNumber} Day ${dayNumber}`).trim() || `Week ${weekNumber} Day ${dayNumber}`,
+          }
+        : null;
+      setReadingTutorActiveUnit(normalizedUnit);
+      setReadingTutorWeekNumber(weekNumber);
+      setReadingTutorDayNumber(dayNumber);
+      resetReadingTutorRun();
+
+      setReadingTutorIllustrationUrl('');
+      setReadingTutorImageStatus('idle');
+
+      updateCloudWordBank(featureId, {
+        words: [],
+        isLoading: false,
+        error: '',
+        loadedAtIso: new Date().toISOString(),
+      });
+
+      console.info('[ReadingTutor] Worksheet unit selected', {
+        featureId,
+        weekNumber,
+        dayNumber,
+        title: normalizedUnit?.title || '',
+      });
+    } catch (error) {
+      updateCloudWordBank(featureId, {
+        words: [],
+        isLoading: false,
+        error: error.message || 'Could not load reading worksheet.',
+      });
+      setReadingTutorFeedback(error.message || 'Could not load worksheet.');
+    }
+  };
+
+  const handleReadingTutorAnswer = async (optionLabel) => {
+    const questions = Array.isArray(readingTutorActiveUnit?.questions) ? readingTutorActiveUnit.questions : [];
+    const currentQuestion = questions[readingTutorQuestionIndex];
+    if (!currentQuestion) return;
+
+    const normalizedLabel = String(optionLabel || '').toUpperCase();
+    const expectedLabel = String(currentQuestion.correctOptionLabel || '').toUpperCase();
+    const isCorrect = expectedLabel
+      ? normalizedLabel === expectedLabel
+      : await evaluateReadingTutorChoice({
+          story: readingTutorActiveUnit?.story || '',
+          questionStem: currentQuestion.stem,
+          options: currentQuestion.options || [],
+          selectedLabel: normalizedLabel,
+        });
+
+    setReadingTutorAnswers((prev) => ({
+      ...prev,
+      [currentQuestion.id]: {
+        selectedLabel: normalizedLabel,
+        isCorrect,
+        attempts: Number(prev?.[currentQuestion.id]?.attempts || 0) + 1,
+      },
+    }));
+
+    if (!isCorrect) {
+      const keywords = extractQuestionKeywords(currentQuestion.stem, 3);
+      const strategyPrompt = keywords.length
+        ? `Word hunt strategy: find ${keywords.join(', ')} in the story first.`
+        : 'Word hunt strategy: find key clue words in the story first.';
+      setReadingTutorHighlightTerms(keywords);
+
+      setReadingTutorFeedback(strategyPrompt);
+      await speakReadingTutorHint(strategyPrompt, keywords[0] || 'the clue');
+      return;
+    }
+
+    setReadingTutorHighlightTerms([]);
+    setReadingTutorScore((prev) => prev + 1);
+    setReadingTutorFeedback('Excellent! You found the correct answer.');
+
+    window.setTimeout(async () => {
+      const nextIndex = readingTutorQuestionIndex + 1;
+      if (nextIndex < questions.length) {
+        setReadingTutorQuestionIndex(nextIndex);
+        return;
+      }
+
+      setReadingTutorCelebrating(true);
+      await launchCelebration();
+      await speakText('Amazing reading! You finished all three questions!');
+    }, 900);
+  };
+
+  const removeReferenceLink = (id) => {
+    let removedResource = null;
+
+    setLinkedResources((prev) => {
+      removedResource = prev.find((resource) => resource.id === id) || null;
+      return prev.filter((resource) => resource.id !== id);
+    });
+
+    if (!user?.uid) return;
+
+    removeCloudReference({
+      db,
+      appId,
+      uid: user.uid,
+      referenceId: id,
+    }).catch((error) => {
+      console.error('Could not remove linked cloud reference:', error);
+      if (removedResource) {
+        setLinkedResources((prev) => [removedResource, ...prev]);
+      }
+    });
   };
 
   const handleSpellAssistPress = () => {
@@ -327,6 +2271,21 @@ Rules:
 
     startListening();
   };
+
+  const { startListening, stopListening } = useSpeechRecognitionLifecycle({
+    isSpeaking,
+    isMockMode,
+    view,
+    step,
+    isConfirming,
+    answers,
+    setIsListening,
+    setLastTranscript,
+    setLastRecognitionState,
+    onTranscript: (transcript) => {
+      void handleVoiceInput(transcript);
+    },
+  });
 
   // ---  handle voice input logic ---
   const isWritingIntent = (text) => {
@@ -359,6 +2318,50 @@ Rules:
     const hasWritingVerb = /(start|write|begin|make|create|tell)/.test(normalized);
     const hasWritingTarget = /(journal|story|writing)/.test(normalized);
     return hasWritingVerb && hasWritingTarget;
+  };
+
+  const openFeature = (featureId) => {
+    const match = featureCards.find((card) => card.id === featureId);
+    if (!match) return;
+
+    stopListening();
+    setSpellResult('');
+    setUserInput('');
+
+    if (match.id === 'writing-journal') {
+      setView('home');
+      setStep('idle');
+      return;
+    }
+
+    if (match.id === 'reading-tutor' || match.id === 'story-a-day') {
+      setReadingPracticeFeatureId(match.id);
+      setReadingTutorWorksheetData({ units: [], byWeekDay: {}, warnings: [] });
+      setReadingTutorActiveUnit(null);
+      setReadingTutorFeedback('');
+      setReadingTutorTranscriptBuffer('');
+      const now = new Date();
+      setReadingTutorWeekNumber(match.id === 'story-a-day' ? now.getDate() : getSchoolWeekNumber(now));
+      setReadingTutorDayNumber(match.id === 'story-a-day' ? 1 : getSchoolDayNumber(now));
+      setReadingTutorQuestionIndex(0);
+      setReadingTutorScore(0);
+      setReadingTutorAnswers({});
+      setReadingTutorHighlightTerms([]);
+      setReadingTutorCelebrating(false);
+      setReadingTutorIllustrationUrl('');
+      setReadingTutorImageStatus('idle');
+      setReadingTutorUnfamiliarWords([]);
+      setReadingTutorWordReviewInProgress(false);
+      setReadingTutorWordReviewCompleted(false);
+      setReadingTutorReviewWordIndex(0);
+      setReadingTutorReadingDoneSignal(0);
+      setReadingTutorDiscussionQuestion('');
+      setReadingTutorDiscussionTurns(0);
+      setReadingTutorDiscussionDone(false);
+    }
+
+    setStep('idle');
+    setView(match.view);
   };
 
   const getSpellRequestWord = (text = '') => {
@@ -732,9 +2735,251 @@ Instructions:
         console.error('Gemini Live cleanup error:', error);
       }
     }
+
+    closeReadingTutorLiveSession('Component unmounted');
+
+    if (spellingPracticeTimerRef.current) {
+      window.clearInterval(spellingPracticeTimerRef.current);
+      spellingPracticeTimerRef.current = null;
+    }
+
+    if (fireworksStopRef.current) {
+      fireworksStopRef.current();
+      fireworksStopRef.current = null;
+    }
   }, []);
 
-  const handleVoiceInput = async (text) => {
+  async function handleVoiceInput(text) {
+    if (view === 'landing') {
+      const landingIntent = getLandingIntent(text);
+      if (!landingIntent) {
+        speakText('Please say Reading Tutor, A Story a Day, Writing Journal, Spelling Champion, Sightwords Master, or 識字高手.');
+        return;
+      }
+
+      if (landingIntent === 'setup') {
+        setView('setup');
+        return;
+      }
+
+      if (landingIntent === 'writing-journal') {
+        setView('home');
+        setStep('idle');
+        startGuidedProcess();
+        return;
+      }
+
+      openFeature(landingIntent);
+      return;
+    }
+
+    if (featurePracticeSession.active && (view === 'sightwordsMaster' || view === 'chineseLiteracy')) {
+      const expectedFeature = view === 'sightwordsMaster' ? 'sightwords-master' : 'chinese-literacy';
+      if (featurePracticeSession.featureId !== expectedFeature) return;
+
+      const current = featurePracticeSession.words[featurePracticeSession.index];
+      if (!current?.word) return;
+
+      const normalizedTranscript = normalizeSpokenPhrase(text);
+      const skipRequested = /\b(i\s*(do\s*not|don'?t)\s*know|next|skip)\b/.test(normalizedTranscript);
+      const deterministicCorrect = matchesSpokenWord(current.word, text) || likelySpokenTokenMatch(current.word, text);
+      const aiEvaluation = (skipRequested || deterministicCorrect)
+        ? { isCorrect: deterministicCorrect, feedback: deterministicCorrect ? 'Great job! Correct!' : '', exampleSentence: '' }
+        : await evaluateFeaturePracticeAnswer({
+            featureId: featurePracticeSession.featureId,
+            expectedWord: current.word,
+            transcript: text,
+          });
+      const isCorrect = !skipRequested && (deterministicCorrect || Boolean(aiEvaluation.isCorrect));
+
+      const currentBox = Math.min(5, Math.max(1, Number(current.reviewFrequency || 1)));
+      const nextFrequency = isCorrect ? Math.min(5, currentBox + 1) : 1;
+
+      await upsertFeatureWordBankEntry({
+        featureId: featurePracticeSession.featureId,
+        word: current.word,
+        reviewFrequency: nextFrequency,
+      });
+
+      if (!isCorrect) {
+        const correction = featurePracticeSession.featureId === 'chinese-literacy'
+          ? `正確答案是 ${current.word}。`
+          : `The correct word is ${current.word}.`;
+        setFeaturePracticeSession((prev) => ({
+          ...prev,
+          feedback: featurePracticeSession.featureId === 'chinese-literacy'
+            ? `再試一次。正確是：${current.word}`
+            : `Try again. Correct word: ${current.word}`,
+        }));
+        await speakText(correction);
+      } else {
+        setFeaturePracticeSession((prev) => ({ ...prev, feedback: aiEvaluation.feedback?.trim() || 'Great job! Correct!' }));
+      }
+
+      const nextIndex = featurePracticeSession.index + 1;
+      if (nextIndex >= featurePracticeSession.words.length) {
+        stopFeaturePracticeSession();
+        await launchCelebration();
+        await speakText('Amazing effort! You did a very good job!');
+        return;
+      }
+
+      setFeaturePracticeSession((prev) => ({
+        ...prev,
+        index: nextIndex,
+      }));
+      return;
+    }
+
+    if (view === 'spellingChampion' && spellingQuizState.open && spellingQuizState.awaitingVoiceAnswer) {
+      setSpellingQuizState((prev) => ({
+        ...prev,
+        answer: normalizeWordToken(text),
+        awaitingVoiceAnswer: false,
+      }));
+      stopListening();
+      return;
+    }
+
+    if (view === 'readingTutor' || view === 'storyADay') {
+      if (view === 'storyADay' && readingTutorWordReviewCompleted && !readingTutorDiscussionDone) {
+        const followup = await getStoryDiscussionFollowup({
+          story: readingTutorActiveUnit?.story || '',
+          childAnswer: text,
+          turns: readingTutorDiscussionTurns,
+        });
+
+        const nextTurns = readingTutorDiscussionTurns + 1;
+        if (followup.confidence >= 0.75 || nextTurns >= 3 || !followup.nextQuestion) {
+          setReadingTutorDiscussionDone(true);
+          setReadingTutorDiscussionQuestion('');
+          setReadingTutorDiscussionTurns(nextTurns);
+          setReadingTutorFeedback('Awesome thinking. If you want, you can now write a reading log in Writing Journal.');
+          await speakText('Awesome thinking. If you want, you can now write a reading log in Writing Journal.');
+          return;
+        }
+
+        setReadingTutorDiscussionTurns(nextTurns);
+        setReadingTutorDiscussionQuestion(followup.nextQuestion);
+        setReadingTutorFeedback(`Great answer. ${followup.nextQuestion}`);
+        await speakText(followup.nextQuestion);
+        return;
+      }
+
+      if (readingTutorWordReviewInProgress) {
+        const words = [...new Set(readingTutorUnfamiliarWords.map(normalizeUnfamiliarWord).filter(Boolean))];
+        const target = words[readingTutorReviewWordIndex] || '';
+        if (!target) {
+          await completeReadingTutorWordReview();
+          return;
+        }
+
+        const spoken = normalizeSpokenPhrase(text);
+        const isCorrect = matchesSpokenWord(target, spoken) || likelySpokenTokenMatch(target, spoken);
+        if (!isCorrect) {
+          setReadingTutorFeedback(`Good try. Listen again: ${target}. Then say ${target}.`);
+          await speakText(`Nice try. The word is ${target}. Please repeat: ${target}.`, { rate: 0.9 });
+          return;
+        }
+
+        const nextIndex = readingTutorReviewWordIndex + 1;
+        if (nextIndex >= words.length) {
+          await speakText('Excellent! You said all unfamiliar words correctly.');
+          setReadingTutorReviewWordIndex(nextIndex);
+          await completeReadingTutorWordReview();
+          return;
+        }
+
+        setReadingTutorReviewWordIndex(nextIndex);
+        const nextWord = words[nextIndex];
+        setReadingTutorFeedback(`Great! Next word: ${nextWord}`);
+        await speakText(`Great. Next word: ${nextWord}. Please say ${nextWord}.`, { rate: 0.92 });
+        return;
+      }
+
+      const normalized = normalizeSpokenPhrase(text);
+      const helpIntent = /\b(help|guidance|guide|stuck|need help|dont understand|don't understand)\b/.test(normalized);
+
+      if (readingTutorSession.awaitingQuestionRead) {
+        const guidance = await getReadingTutorQuestionGuidance({
+          worksheetTopic: readingTutorSession.worksheetTopic,
+          questionLabel: readingTutorSession.currentQuestionLabel,
+          questionText: text,
+        });
+
+        setReadingTutorSession((prev) => ({
+          ...prev,
+          awaitingQuestionRead: false,
+          awaitingQuestionLabel: false,
+        }));
+        setReadingTutorFeedback(guidance);
+        await speakText(guidance);
+        return;
+      }
+
+      if (readingTutorSession.awaitingQuestionLabel) {
+        const numberMatch = normalized.match(/\b(\d{1,2})\b/);
+        const label = numberMatch ? `Question ${numberMatch[1]}` : text.trim();
+        setReadingTutorSession((prev) => ({
+          ...prev,
+          awaitingQuestionLabel: false,
+          awaitingQuestionRead: true,
+          currentQuestionLabel: label,
+        }));
+        const askRead = `Great. Please read ${label} out loud, and I will guide you step by step.`;
+        setReadingTutorFeedback(askRead);
+        await speakText(askRead);
+        return;
+      }
+
+      if (helpIntent) {
+        setReadingTutorSession((prev) => ({
+          ...prev,
+          awaitingQuestionLabel: true,
+          awaitingQuestionRead: false,
+        }));
+        const askQuestion = 'Sure. Which question do you need help with? Tell me the question number.';
+        setReadingTutorFeedback(askQuestion);
+        await speakText(askQuestion);
+        return;
+      }
+
+      const nextTranscript = [readingTutorTranscriptBuffer, text.trim()].filter(Boolean).join(' ').trim();
+      const isDone = await shouldAutoFinalizeReading({
+        transcriptBuffer: nextTranscript,
+        latestText: text,
+      });
+
+      if (!isDone) {
+        setReadingTutorTranscriptBuffer(nextTranscript);
+        return;
+      }
+
+      const worksheetStory = [nextTranscript]
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (worksheetStory) {
+        console.info('[ReadingTutor] Worksheet identified from student story', {
+          worksheetStory,
+          grade,
+          capturedAtIso: new Date().toISOString(),
+        });
+      }
+
+      const worksheetFeedback = await getReadingTutorWorksheetFeedback({ transcript: worksheetStory || text });
+      setReadingTutorSession((prev) => ({
+        ...prev,
+        worksheetTopic: worksheetStory || text.trim() || prev.worksheetTopic,
+      }));
+      setReadingTutorTranscriptBuffer('');
+      setReadingTutorReadingDoneSignal((prev) => prev + 1);
+      setReadingTutorFeedback(worksheetFeedback);
+      await speakText(worksheetFeedback);
+      return;
+    }
+
     if (view === 'journaling' && isSpellRequest(text)) {
       const word = getSpellRequestWord(text);
       if (word) {
@@ -743,7 +2988,7 @@ Instructions:
       return;
     }
 
-    if (step === 'idle' && isWritingIntent(text)) {
+    if (view === 'home' && step === 'idle' && isWritingIntent(text)) {
       startGuidedProcess();
       return;
     }
@@ -766,7 +3011,7 @@ Instructions:
         await processInitialAnswer(text);
       }
     }
-  };
+  }
 
   // --- 5W1H logic ---
   const startGuidedProcess = () => {
@@ -1039,6 +3284,370 @@ Instructions:
     throw new Error('Gemini request failed after retries.');
   };
 
+  async function getSpellingCoachHint({ word, attemptedAnswer }) {
+    const fallbackHint = `Let us try this together. Listen for sounds in ${word}.`;
+    if (!googleAIKey) return fallbackHint;
+    const customPrompt = (featureCustomMessages['spelling-champion'] || '').trim();
+
+    const prompt = `${SPELLING_TEACHER_SYSTEM_PROMPT}
+You are coaching a child in a spelling game.
+Target word: ${word}
+Student attempt: ${attemptedAnswer || '(no answer)'}
+${customPrompt ? `Feature custom requirement:\n${customPrompt}` : ''}
+
+Return one short, encouraging coaching sentence focused on phonetic awareness. Keep it under 18 words.`;
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      });
+
+      const result = await response.json();
+      const text = (result.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      return text || fallbackHint;
+    } catch {
+      return fallbackHint;
+    }
+  }
+
+  async function getReadingTutorWorksheetFeedback({ transcript }) {
+    const fallback = 'I am listening. If you need help, say: I need help on a question.';
+    if (!googleAIKey) return fallback;
+
+    const customPrompt = (featureCustomMessages['reading-tutor'] || '').trim();
+
+    const prompt = `You are a supportive reading tutor for elementary students.
+Student transcript about worksheet context: ${transcript}
+Student grade: ${grade}
+${customPrompt ? `Feature custom requirement:\n${customPrompt}` : ''}
+
+Return one short response (max 18 words):
+- confirm you understood the worksheet/topic
+- invite student to ask for question guidance.`;
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      });
+
+      const result = await response.json();
+      const text = (result.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      return text || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  const buildReadingTutorGuidancePrompt = ({ worksheetTopic, questionLabel, questionText }) => {
+    const strategyByGrade = {
+      Kindergarten: 'Use picture clues, repeat key words, and ask simple who/what questions.',
+      'Grade 1': 'Use decoding + sight words, chunk short phrases, and identify what the question asks.',
+      'Grade 2': 'Find key words, reread nearby sentences, and choose evidence from the text.',
+      'Grade 3': 'Restate the question, scan for evidence, and explain why the evidence matches.',
+      'Grade 4': 'Identify question type, locate evidence, and justify answer with text details.',
+      'Grade 5': 'Summarize the question, compare evidence options, and justify with precise text evidence.',
+    };
+
+    const customPrompt = (featureCustomMessages['reading-tutor'] || '').trim();
+    return `Student grade: ${grade}
+Worksheet topic/context: ${worksheetTopic || 'not specified'}
+Question label: ${questionLabel || 'not specified'}
+Question text read by student: ${questionText}
+Grade strategy: ${strategyByGrade[grade] || strategyByGrade['Grade 1']}
+${customPrompt ? `Feature custom requirement:\n${customPrompt}` : ''}
+
+Task:
+- Guide the student to discover the answer using reading strategies suitable for the grade.
+- Do not give the final answer directly unless the student explicitly asks for direct answer.
+- Use scaffolded support: identify key words, restate the question, hint where to look, ask one guiding question.
+
+Output:
+- One concise coaching response, maximum 60 words.
+- Include 2-3 concrete steps and exactly one guiding question at the end.
+- Friendly, encouraging, and actionable.`;
+  };
+
+  const extractReadingTutorLiveText = (message = {}) => {
+    const candidateParts = [
+      ...(message.serverContent?.modelTurn?.parts || []),
+      ...(message.candidates?.[0]?.content?.parts || []),
+    ];
+
+    for (const part of candidateParts) {
+      const text = String(part?.text || '').trim();
+      if (text) return text;
+    }
+
+    return '';
+  };
+
+  const closeReadingTutorLiveSession = (reason = 'Closing Reading Tutor Gemini Live session') => {
+    if (readingTutorLivePendingRef.current) {
+      window.clearTimeout(readingTutorLivePendingRef.current.timeoutId);
+      readingTutorLivePendingRef.current.reject(new Error(reason));
+      readingTutorLivePendingRef.current = null;
+    }
+
+    if (readingTutorLiveSocketRef.current) {
+      try {
+        readingTutorLiveSocketRef.current.close(1000, reason);
+      } catch {
+        // no-op
+      }
+    }
+
+    readingTutorLiveSocketRef.current = null;
+    readingTutorLiveSetupPromiseRef.current = null;
+  };
+
+  const setupReadingTutorLiveSocket = (modelName) => new Promise((resolve, reject) => {
+    let setupResolved = false;
+
+    const socket = new WebSocket(
+      `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${googleAIKey}`
+    );
+    socket.binaryType = 'arraybuffer';
+    readingTutorLiveSocketRef.current = socket;
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify({
+        setup: {
+          model: `models/${modelName}`,
+          generationConfig: {
+            responseModalities: ['TEXT'],
+          },
+          systemInstruction: { parts: [{ text: readingTutorLiveSystemInstruction }] },
+        },
+      }));
+    };
+
+    socket.onmessage = async (event) => {
+      try {
+        let rawMessage = '';
+
+        if (typeof event.data === 'string') {
+          rawMessage = event.data;
+        } else if (event.data instanceof ArrayBuffer) {
+          rawMessage = new TextDecoder().decode(event.data);
+        } else if (typeof Blob !== 'undefined' && event.data instanceof Blob) {
+          rawMessage = await event.data.text();
+        } else {
+          rawMessage = String(event.data ?? '');
+        }
+
+        const message = JSON.parse(rawMessage);
+
+        if (message.error) {
+          const errorMessage = message.error.message || 'Reading Tutor Gemini Live returned an error.';
+          reject(new Error(errorMessage));
+          return;
+        }
+
+        if (message.setupComplete && !setupResolved) {
+          setupResolved = true;
+          resolve(socket);
+          return;
+        }
+
+        const liveText = extractReadingTutorLiveText(message);
+        if (!liveText || !readingTutorLivePendingRef.current) return;
+
+        window.clearTimeout(readingTutorLivePendingRef.current.timeoutId);
+        readingTutorLivePendingRef.current.resolve(liveText);
+        readingTutorLivePendingRef.current = null;
+      } catch (error) {
+        reject(error);
+      }
+    };
+
+    socket.onerror = () => {
+      reject(new Error('Reading Tutor Gemini Live connection failed'));
+    };
+
+    socket.onclose = () => {
+      readingTutorLiveSocketRef.current = null;
+      if (readingTutorLivePendingRef.current) {
+        window.clearTimeout(readingTutorLivePendingRef.current.timeoutId);
+        readingTutorLivePendingRef.current.reject(new Error('Reading Tutor Gemini Live session closed'));
+        readingTutorLivePendingRef.current = null;
+      }
+    };
+  });
+
+  const ensureReadingTutorLiveSession = async () => {
+    if (readingTutorLiveSocketRef.current?.readyState === WebSocket.OPEN) {
+      return readingTutorLiveSocketRef.current;
+    }
+
+    if (readingTutorLiveSetupPromiseRef.current) {
+      return readingTutorLiveSetupPromiseRef.current;
+    }
+
+    readingTutorLiveSetupPromiseRef.current = (async () => {
+      try {
+        return await setupReadingTutorLiveSocket(readingTutorLiveModel);
+      } catch (primaryError) {
+        closeReadingTutorLiveSession('Primary Reading Tutor model setup failed');
+        if (readingTutorLiveFallbackModel === readingTutorLiveModel) {
+          throw primaryError;
+        }
+        return setupReadingTutorLiveSocket(readingTutorLiveFallbackModel);
+      } finally {
+        readingTutorLiveSetupPromiseRef.current = null;
+      }
+    })();
+
+    return readingTutorLiveSetupPromiseRef.current;
+  };
+
+  const requestReadingTutorLiveGuidance = async ({ worksheetTopic, questionLabel, questionText }) => {
+    if (!googleAIKey || typeof window === 'undefined' || typeof window.WebSocket === 'undefined') return '';
+
+    try {
+      const socket = await ensureReadingTutorLiveSession();
+      const requestId = `reading_tutor_guidance_${Date.now()}_${readingTutorLiveRequestCounterRef.current += 1}`;
+
+      if (readingTutorLivePendingRef.current) {
+        window.clearTimeout(readingTutorLivePendingRef.current.timeoutId);
+        readingTutorLivePendingRef.current.reject(new Error('Superseded by a newer reading tutor guidance request'));
+        readingTutorLivePendingRef.current = null;
+      }
+
+      const liveText = await new Promise((resolve, reject) => {
+        const timeoutId = window.setTimeout(() => {
+          if (readingTutorLivePendingRef.current?.requestId === requestId) {
+            readingTutorLivePendingRef.current = null;
+          }
+          reject(new Error('Reading Tutor Gemini Live guidance timed out'));
+        }, 9000);
+
+        readingTutorLivePendingRef.current = {
+          requestId,
+          resolve,
+          reject,
+          timeoutId,
+        };
+
+        socket.send(JSON.stringify({
+          realtimeInput: {
+            text: buildReadingTutorGuidancePrompt({ worksheetTopic, questionLabel, questionText }),
+          },
+        }));
+      });
+
+      return String(liveText || '').trim();
+    } catch {
+      closeReadingTutorLiveSession('Reset after Reading Tutor Gemini Live guidance failure');
+      return '';
+    }
+  };
+
+  async function getReadingTutorQuestionGuidance({ worksheetTopic, questionLabel, questionText }) {
+    const fallback = 'Let us find key words first. Read the question slowly and underline what it asks.';
+    if (!googleAIKey) return fallback;
+
+    const liveText = await requestReadingTutorLiveGuidance({ worksheetTopic, questionLabel, questionText });
+    if (liveText) return liveText;
+
+    const prompt = buildReadingTutorGuidancePrompt({ worksheetTopic, questionLabel, questionText });
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+        }),
+      });
+
+      const result = await response.json();
+      const text = (result.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      return text || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  async function evaluateFeaturePracticeAnswer({ featureId, expectedWord, transcript }) {
+    const normalizedTranscript = normalizeSpokenPhrase(transcript);
+    const fallbackCorrect = matchesSpokenWord(expectedWord, transcript);
+    const fallback = {
+      isCorrect: fallbackCorrect,
+      feedback: fallbackCorrect ? 'Great job! Correct!' : `Not quite. The correct word is ${expectedWord}.`,
+      exampleSentence: '',
+    };
+
+    if (!googleAIKey || !expectedWord.trim() || !normalizedTranscript) return fallback;
+
+    const isChineseFeature = featureId === 'chinese-literacy';
+    const systemPrompt = isChineseFeature
+      ? CHINESE_LITERACY_TEACHER_SYSTEM_PROMPT
+      : SIGHTWORD_TEACHER_SYSTEM_PROMPT;
+    const customPrompt = (featureCustomMessages[featureId] || '').trim();
+    const prompt = `${systemPrompt}
+
+Task:
+- Evaluate whether the child correctly read the target word.
+- Be tolerant of messy speech, but do NOT mark correct if the target appears only incidentally in a longer unrelated phrase.
+- Reduce false positives: if uncertain, return isCorrect=false.
+- Improve true-positive recall for children: if transcript appears to be an ASR misspelling or close phonetic attempt of the target, prefer isCorrect=true.
+
+Feature: ${featureId}
+Target word: ${expectedWord}
+Child transcript: ${transcript}
+${customPrompt ? `Feature custom requirement:\n${customPrompt}` : ''}
+
+Return JSON only with this shape:
+{
+  "isCorrect": boolean,
+  "feedback": "short encouraging sentence",
+  "exampleSentence": "one natural child-friendly sentence using target word; empty string if not needed"
+}
+
+Rules:
+- feedback max 20 words.
+- If isCorrect=true, exampleSentence can be empty.
+- If isCorrect=false, exampleSentence should be natural and age-appropriate.`;
+
+    try {
+      const response = await fetchGeminiWithRetry(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${googleAIKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
+
+      const result = await response.json();
+      const raw = (result.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+      if (!raw) return fallback;
+
+      const parsed = JSON.parse(raw);
+      const isCorrect = Boolean(parsed?.isCorrect);
+      const feedback = String(parsed?.feedback || '').trim();
+      const exampleSentence = String(parsed?.exampleSentence || '').trim();
+
+      return {
+        isCorrect,
+        feedback: feedback || (isCorrect ? 'Great job! Correct!' : `Not quite. The correct word is ${expectedWord}.`),
+        exampleSentence: isCorrect ? '' : exampleSentence,
+      };
+    } catch {
+      return fallback;
+    }
+  }
+
   const getGradePromptGuidance = (selectedGrade) => {
     const gradeGuidance = {
       Kindergarten: `Kindergarten writing goals:
@@ -1292,14 +3901,29 @@ General rules:
   //   }
   // };
 
+  function stopSpeaking() {
+    try {
+      window.speechSynthesis.cancel();
+    } catch {
+      // no-op
+    }
+    setIsSpeaking(false);
+  }
+
   const speakText = async (text, options = {}) => {
     const { rate = 0.9 } = options;
     // if (isMockMode) {
       console.log("[Mock TTS]:", text);
       return new Promise((resolve) => {
+        stopSpeaking();
+        setIsSpeaking(true);
         const ut = new SpeechSynthesisUtterance(text);
         ut.lang = 'en-US';
         ut.rate = rate;
+        ut.onerror = () => {
+          setIsSpeaking(false);
+          resolve();
+        };
         ut.onend = () => {
         setIsSpeaking(false);
         resolve();
@@ -1383,6 +4007,17 @@ General rules:
     startListening();
   };
 
+  const toggleReadingTutorListening = () => {
+    if (isListening || readingTutorContinuousListening) {
+      setReadingTutorContinuousListening(false);
+      stopListening();
+      return;
+    }
+
+    setReadingTutorContinuousListening(true);
+    startListening();
+  };
+
 
   const startCamera = async () => {
     setCameraMode(true);
@@ -1405,19 +4040,42 @@ General rules:
   };
 
   const saveSettings = () => {
+    const writingCustom = (featureCustomMessages['writing-journal'] || customExpectation || '').trim();
     localStorage.setItem('journal_buddy_name', studentName);
     localStorage.setItem('journal_buddy_grade', grade);
-    localStorage.setItem('journal_buddy_custom_expectation', customExpectation.trim());
-    setView('home');
+    localStorage.setItem('journal_buddy_custom_expectation', writingCustom);
+    setCustomExpectation(writingCustom);
+    setView('landing');
+  };
+
+  const saveFeatureCustomizationDraft = () => {
+    const message = draftFeatureCustomMessage.trim();
+    const featureId = normalizeFeatureId(selectedCustomizeFeature);
+
+    setFeatureCustomMessages((prev) => ({
+      ...prev,
+      [featureId]: message,
+    }));
+
+    if (featureId === 'writing-journal') {
+      setCustomExpectation(message);
+      localStorage.setItem('journal_buddy_custom_expectation', message);
+    }
   };
 
   const openCustomExpectationModal = () => {
-    setDraftCustomExpectation(customExpectation);
+    const writingMessage = featureCustomMessages['writing-journal'] || customExpectation;
+    setDraftCustomExpectation(writingMessage);
     setShowCustomExpectationModal(true);
   };
 
   const saveCustomExpectation = () => {
-    setCustomExpectation(draftCustomExpectation.trim());
+    const message = draftCustomExpectation.trim();
+    setCustomExpectation(message);
+    setFeatureCustomMessages((prev) => ({
+      ...prev,
+      'writing-journal': message,
+    }));
     setShowCustomExpectationModal(false);
     setIsCustomListening(false);
   };
@@ -1425,6 +4083,10 @@ General rules:
   const clearCustomExpectation = () => {
     setDraftCustomExpectation('');
     setCustomExpectation('');
+    setFeatureCustomMessages((prev) => ({
+      ...prev,
+      'writing-journal': '',
+    }));
     localStorage.removeItem('journal_buddy_custom_expectation');
   };
 
@@ -1538,7 +4200,7 @@ General rules:
   ];
 
   const goToHomePage = () => {
-    setView('home');
+    setView('landing');
     setStep('idle');
     setSpellResult('');
     stopListening();
@@ -1560,6 +4222,78 @@ General rules:
     return () => clearTimeout(timer);
   }, [view, isMockMode, isListening, isSpeaking]);
 
+  useEffect(() => {
+    if (!user?.uid) return;
+    if (view === 'sightwordsMaster') {
+      void loadFeatureWordBankState('sightwords-master');
+    }
+    if (view === 'chineseLiteracy') {
+      void loadFeatureWordBankState('chinese-literacy');
+    }
+  }, [view, user?.uid]);
+
+  useEffect(() => {
+    if (featurePracticeSession.active && !['sightwordsMaster', 'chineseLiteracy'].includes(view)) {
+      stopFeaturePracticeSession();
+    }
+
+    if (view !== 'spellingChampion') {
+      if (spellingPracticeState.open) stopSpellingPracticeLoop();
+      if (spellingQuizState.open) closeSpellingQuiz();
+    }
+  }, [view]);
+
+  useEffect(() => {
+    if (!spellingPracticeState.open || spellingCache.words.length === 0) return;
+
+    if (spellingPracticeTimerRef.current) {
+      window.clearInterval(spellingPracticeTimerRef.current);
+      spellingPracticeTimerRef.current = null;
+    }
+
+    const speakPracticeWord = (index) => {
+      const word = spellingCache.words[index % spellingCache.words.length] || '';
+      if (!word) return;
+      void speakText(`${word}. Let's spell it together. ${spellOutWordNaturally(word)}.`, { rate: 0.72 });
+    };
+
+    speakPracticeWord(spellingPracticeState.index);
+
+    spellingPracticeTimerRef.current = window.setInterval(() => {
+      setSpellingPracticeState((prev) => {
+        if (!prev.open || spellingCache.words.length === 0) return prev;
+        const nextIndex = (prev.index + 1) % spellingCache.words.length;
+        speakPracticeWord(nextIndex);
+        return { ...prev, index: nextIndex };
+      });
+    }, 8000);
+
+    return () => {
+      if (spellingPracticeTimerRef.current) {
+        window.clearInterval(spellingPracticeTimerRef.current);
+        spellingPracticeTimerRef.current = null;
+      }
+    };
+  }, [spellingPracticeState.open, spellingCache.words]);
+
+  useEffect(() => {
+    const isFeaturePracticeView = featurePracticeSession.active
+      && ['sightwordsMaster', 'chineseLiteracy'].includes(view);
+    if (!isFeaturePracticeView || isListening || isSpeaking) return;
+
+    const timer = window.setTimeout(() => {
+      startListening();
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [featurePracticeSession.active, view, isListening, isSpeaking, startListening]);
+
+  useEffect(() => {
+    if (view === 'readingTutor' || view === 'storyADay') return;
+    if (!readingTutorContinuousListening) return;
+    setReadingTutorContinuousListening(false);
+  }, [view, readingTutorContinuousListening]);
+
   const uploadPhoto = async (withUpload) => {
     if (!user) return;
     setIsSaving(true);
@@ -1576,21 +4310,52 @@ General rules:
         rawAnswers: answers,
         grade: grade
       });
-      setShowUploadModal(false); setCapturedImage(null); setView('home'); setStep('idle');
+      setShowUploadModal(false); setCapturedImage(null); setView('landing'); setStep('idle');
     } catch (e) { console.error(e); } finally { setIsSaving(false); }
+  };
+
+  const goToLandingPage = () => {
+    setView('landing');
+    setStep('idle');
+    setReadingTutorFeedback('');
+    setReadingTutorTranscriptBuffer('');
+    setReadingPracticeFeatureId('reading-tutor');
+    setReadingTutorContinuousListening(false);
+    setReadingTutorSession({
+      worksheetTopic: '',
+      awaitingQuestionLabel: false,
+      awaitingQuestionRead: false,
+      currentQuestionLabel: '',
+    });
+    setReadingTutorWorksheetData({ units: [], byWeekDay: {}, warnings: [] });
+    setReadingTutorActiveUnit(null);
+    setReadingTutorQuestionIndex(0);
+    setReadingTutorScore(0);
+    setReadingTutorAnswers({});
+    setReadingTutorHighlightTerms([]);
+    setReadingTutorCelebrating(false);
+    setReadingTutorIllustrationUrl('');
+    setReadingTutorImageStatus('idle');
+    setReadingTutorUnfamiliarWords([]);
+    setReadingTutorWordReviewInProgress(false);
+    setReadingTutorWordReviewCompleted(false);
+    setReadingTutorDiscussionQuestion('');
+    setReadingTutorDiscussionTurns(0);
+    setReadingTutorDiscussionDone(false);
+    stopListening();
   };
 
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fff8e7_0%,_#f5ebd7_42%,_#eadbc2_100%)] font-sans text-gray-800 p-4 md:p-6 flex flex-col items-center">
       <header className="w-full max-w-5xl flex justify-between items-center py-4 mb-4">
-        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { setView('home'); setStep('idle'); }}>
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { setView('landing'); setStep('idle'); stopListening(); }}>
           <div className="bg-gradient-to-br from-orange-500 to-amber-500 p-2.5 rounded-2xl shadow-lg shadow-orange-200">
             <BookOpen className="text-white" />
           </div>
           <div>
-            <p className="text-[10px] md:text-xs uppercase tracking-[0.35em] text-orange-700/70 font-bold">Voice Writing Studio</p>
-            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Writing Buddy</h1>
+            <p className="text-[10px] md:text-xs uppercase tracking-[0.35em] text-orange-700/70 font-bold">Voice Learning Studio</p>
+            <h1 className="text-2xl font-black text-orange-950 tracking-tight">Learning Buddy</h1>
           </div>
         </div>
         
@@ -1688,31 +4453,132 @@ General rules:
                     </div>
                   </div>
 
-                  <div className="rounded-[2rem] border border-dashed border-stone-300 bg-white px-5 py-5">
-                    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="space-y-2">
-                        <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Custom</p>
-                        <p className="text-sm leading-6 text-stone-600">
-                          Add a parent note if you want Writing Buddy to emphasize something beyond the grade-level default.
-                        </p>
-                        {customExpectation.trim() && (
-                          <p className="text-sm leading-6 text-stone-900 font-semibold">
-                            "{customExpectation.trim()}"
+                  <CloudReferenceSettings
+                    cloudConnections={effectiveCloudConnections}
+                    cloudConnectProvider={cloudConnectProvider}
+                    onCloudConnectProviderChange={setCloudConnectProvider}
+                    linkDraft={linkDraft}
+                    onLinkDraftChange={updateLinkDraft}
+                    onConnectProvider={connectProvider}
+                    onAddReference={addReferenceLink}
+                    linkedResources={linkedResources}
+                    onRemoveReference={removeReferenceLink}
+                    featureOptions={referenceFeatureOptions}
+                    isCloudStateReady={isCloudStateReady}
+                    onOpenCloudBrowser={openCloudBrowser}
+                    onCloseCloudBrowser={closeCloudBrowser}
+                    onEnterCloudFolder={enterCloudFolder}
+                    onGoToCloudFolderFromPath={goToCloudFolderFromPath}
+                    onSelectCloudResource={selectCloudResource}
+                    cloudBrowser={cloudBrowser}
+                    isBusy={isCloudActionBusy}
+                    actionError={cloudActionError}
+                  />
+
+                  <div className="rounded-[2rem] border border-dashed border-stone-300 bg-white px-5 py-5 space-y-4">
+                    <div className="space-y-2">
+                      <p className="text-xs uppercase tracking-[0.28em] text-stone-500 font-black">Feature customization</p>
+                      <p className="text-sm leading-6 text-stone-600">
+                        Pick a feature and add a custom requirement. Journal Buddy custom message is injected into AI journal generation.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                      {featureCustomizationOptions.map((option) => (
+                        <button
+                          key={option.value}
+                          onClick={() => setSelectedCustomizeFeature(option.value)}
+                          className={`rounded-xl px-3 py-2 text-xs font-black uppercase tracking-[0.12em] transition-colors ${
+                            selectedCustomizeFeature === option.value
+                              ? 'bg-stone-900 text-white'
+                              : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                          }`}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {selectedCustomizeFeature === 'writing-journal' ? (
+                      <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="space-y-2">
+                          <p className="text-xs uppercase tracking-[0.22em] text-stone-500 font-black">Journal Buddy custom</p>
+                          <p className="text-sm leading-6 text-stone-600">
+                            This message is added to Journal Buddy AI prompt so generated writing follows your requirement.
                           </p>
-                        )}
+                          {(featureCustomMessages['writing-journal'] || customExpectation).trim() && (
+                            <p className="text-sm leading-6 text-stone-900 font-semibold">
+                              "{(featureCustomMessages['writing-journal'] || customExpectation).trim()}"
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={openCustomExpectationModal}
+                          className="rounded-[1.25rem] bg-stone-900 px-4 py-3 text-sm font-black uppercase tracking-[0.14em] text-white shadow-sm hover:bg-stone-800"
+                        >
+                          {(featureCustomMessages['writing-journal'] || customExpectation).trim() ? 'Edit Custom' : 'Custom'}
+                        </button>
                       </div>
-                      <button
-                        onClick={openCustomExpectationModal}
-                        className="rounded-[1.25rem] bg-stone-900 px-4 py-3 text-sm font-black uppercase tracking-[0.14em] text-white shadow-sm hover:bg-stone-800"
-                      >
-                        {customExpectation.trim() ? 'Edit Custom' : 'Custom'}
-                      </button>
+                    ) : (
+                      <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 space-y-3">
+                        <p className="text-sm text-stone-600">
+                          Requirement for <span className="font-black text-stone-800">{selectedCustomizationCard?.title || 'this feature'}</span>. It will be used as feature behavior guidance.
+                        </p>
+                        <textarea
+                          value={draftFeatureCustomMessage}
+                          onChange={(e) => setDraftFeatureCustomMessage(e.target.value)}
+                          rows={3}
+                          maxLength={300}
+                          placeholder="Add requirement for this feature..."
+                          className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm"
+                        />
+                        <div className="flex items-center justify-between text-xs text-stone-500">
+                          <span>{draftFeatureCustomMessage.length}/300</span>
+                          <button
+                            onClick={saveFeatureCustomizationDraft}
+                            className="rounded-lg bg-stone-900 px-3 py-1.5 font-black uppercase tracking-[0.12em] text-white hover:bg-stone-800"
+                          >
+                            Save Feature Custom
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="rounded-xl border border-stone-200 bg-stone-50 px-4 py-4 space-y-3">
+                      <p className="text-xs uppercase tracking-[0.22em] text-stone-500 font-black">Linked references for selected feature</p>
+                      {getFeatureReferences(selectedCustomizeFeature).length === 0 && (
+                        <p className="text-sm text-stone-600">
+                          No references linked to {selectedCustomizationCard?.title || 'this feature'} yet.
+                        </p>
+                      )}
+
+                      {getFeatureReferences(selectedCustomizeFeature).length > 0 && (
+                        <div className="space-y-2 max-h-44 overflow-auto pr-1">
+                          {getFeatureReferences(selectedCustomizeFeature).map((resource) => (
+                            <div key={resource.id} className="rounded-lg border border-stone-200 bg-white px-3 py-3 flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="text-sm font-black text-stone-800 truncate">{resource.label || 'Linked reference'}</p>
+                                <p className="mt-1 text-xs text-stone-500 uppercase tracking-[0.12em]">
+                                  {resource.provider} • {resource.resourceType}
+                                </p>
+                                <p className="mt-1 text-xs text-stone-500 break-all">{resource.target}</p>
+                              </div>
+                              <button
+                                onClick={() => removeReferenceLink(resource.id)}
+                                className="shrink-0 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-xs font-black uppercase tracking-[0.12em] text-rose-700 hover:bg-rose-100"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
 
                 <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-                  <button onClick={() => setView('home')} className="flex-1 rounded-[1.75rem] bg-stone-100 px-6 py-4 text-sm font-black uppercase tracking-[0.16em] text-stone-600 hover:bg-stone-200 transition-colors">
+                  <button onClick={() => setView('landing')} className="flex-1 rounded-[1.75rem] bg-stone-100 px-6 py-4 text-sm font-black uppercase tracking-[0.16em] text-stone-600 hover:bg-stone-200 transition-colors">
                     Cancel
                   </button>
                   <button onClick={saveSettings} className="flex-1 rounded-[1.75rem] bg-[linear-gradient(135deg,_#f97316,_#f59e0b)] px-6 py-4 text-sm font-black uppercase tracking-[0.16em] text-white shadow-lg shadow-orange-200 transition-transform active:scale-[0.99]">
@@ -1724,354 +4590,200 @@ General rules:
           </div>
         )}
 
+        {view === 'landing' && (
+          <LandingView
+            grade={grade}
+            isListening={isListening}
+            onToggleListening={toggleListening}
+            featureCards={landingFeatureCards}
+            onOpenFeature={openFeature}
+          />
+        )}
+
         {view === 'home' && (
-          <div className="flex-1 flex flex-col justify-center text-center relative z-10">
-            {step === 'idle' && (
-              <div className="animate-in fade-in slide-in-from-top-4 grid gap-8 lg:grid-cols-[1.2fr_0.8fr] items-center text-left">
-                <div className="space-y-6">
-                  <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-white/75 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.3em] text-orange-700 shadow-sm">
-                    <Sparkles size={14} className="text-orange-500" />
-                    Gentle voice journaling
-                  </div>
+          <WritingHomeView
+            step={step}
+            isGuidedStep={isGuidedStep}
+            answers={answers}
+            grade={grade}
+            isLocal={isLocal}
+            isListening={isListening}
+            isMockMode={isMockMode}
+            userInput={userInput}
+            isConfirming={isConfirming}
+            fiveWSteps={fiveWSteps}
+            canGoToPreviousQuestion={canGoToPreviousQuestion}
+            generatedJournal={generatedJournal}
+            getStepQuestion={getStepQuestion}
+            getLiveStatusMeta={getLiveStatusMeta}
+            getLocalDebugRows={getLocalDebugRows}
+            getFlowSummaryCards={getFlowSummaryCards}
+            onToggleListening={toggleListening}
+            onMoveToPrevStep={moveToPrevStep}
+            onGuidedMicClick={() => {
+              stopListening();
+              startListening();
+            }}
+            onSpeakText={speakText}
+            onGoToWritingPage={goToWritingPage}
+            onRestart={() => setStep('idle')}
+            onBackToMenu={goToLandingPage}
+          />
+        )}
 
-                  <div className="space-y-4">
-                    <h2 className="max-w-2xl text-5xl md:text-6xl font-black text-stone-900 leading-[0.92] tracking-[-0.05em]">
-                      A softer start for little storytellers.
-                    </h2>
-                    <p className="max-w-xl text-lg md:text-xl leading-relaxed text-stone-600 font-medium">
-                      Writing Buddy listens first, guides one question at a time, and turns everyday moments into a story kids can actually write down.
-                    </p>
-                  </div>
+        {view === 'readingTutor' && (
+          <ReadingTutorView
+            isListening={isListening}
+            onBackToMenu={goToLandingPage}
+            mode="reading-tutor"
+            linkedResources={getFeatureReferences('reading-tutor')}
+            cloudWordsLoadedAtIso={cloudWordBanks['reading-tutor']?.loadedAtIso || ''}
+            cloudWordsError={cloudWordBanks['reading-tutor']?.error || ''}
+            isCloudWordsLoading={Boolean(cloudWordBanks['reading-tutor']?.isLoading)}
+            onLoadCloudWords={loadReadingTutorWorksheet}
+            tutorFeedback={readingTutorFeedback}
+            isContinuousListening={readingTutorContinuousListening}
+            worksheetWarnings={readingTutorWorksheetData.warnings || []}
+            activeWorksheet={readingTutorActiveUnit}
+            questionIndex={readingTutorQuestionIndex}
+            score={readingTutorScore}
+            answers={readingTutorAnswers}
+            highlightTerms={readingTutorHighlightTerms}
+            onAnswer={handleReadingTutorAnswer}
+            isCelebrating={readingTutorCelebrating}
+            unfamiliarWords={readingTutorUnfamiliarWords}
+            onStoryWordTap={handleReadingTutorStoryWordTap}
+            onPlayWord={handleReadingTutorStoryWordTap}
+            onStartWordReview={startReadingTutorWordReview}
+            isWordReviewing={readingTutorWordReviewInProgress}
+            isWordReviewCompleted={readingTutorWordReviewCompleted}
+            showQuestions={readingTutorWordReviewCompleted}
+            readingDoneSignal={readingTutorReadingDoneSignal}
+            discussionQuestion={''}
+            discussionDone={true}
+            onOpenWritingJournal={goToStoryPreview}
+          />
+        )}
 
-                  <div className="grid gap-3 sm:grid-cols-3">
-                    {[
-                      ['Listen', 'Voice-first prompts that feel like a patient buddy.'],
-                      ['Guide', 'Simple 5W1H steps that keep kids moving.'],
-                      ['Celebrate', 'A finished idea they can read, draw, and save.']
-                    ].map(([title, copy]) => (
-                      <div key={title} className="rounded-[1.6rem] border border-white/80 bg-white/70 p-4 shadow-[0_12px_30px_rgba(148,101,47,0.08)] backdrop-blur-sm">
-                        <p className="text-sm font-black uppercase tracking-[0.18em] text-stone-900">{title}</p>
-                        <p className="mt-2 text-sm leading-6 text-stone-600">{copy}</p>
-                      </div>
-                    ))}
-                  </div>
+        {view === 'storyADay' && (
+          <StoryADayView
+            isListening={isListening}
+            onBackToMenu={goToLandingPage}
+            linkedResources={getFeatureReferences('story-a-day')}
+            cloudWordsLoadedAtIso={cloudWordBanks['story-a-day']?.loadedAtIso || ''}
+            cloudWordsError={cloudWordBanks['story-a-day']?.error || ''}
+            isCloudWordsLoading={Boolean(cloudWordBanks['story-a-day']?.isLoading)}
+            onLoadCloudWords={loadReadingTutorWorksheet}
+            tutorFeedback={readingTutorFeedback}
+            isContinuousListening={readingTutorContinuousListening}
+            worksheetWarnings={readingTutorWorksheetData.warnings || []}
+            activeWorksheet={readingTutorActiveUnit}
+            questionIndex={readingTutorQuestionIndex}
+            score={readingTutorScore}
+            answers={readingTutorAnswers}
+            highlightTerms={readingTutorHighlightTerms}
+            onAnswer={handleReadingTutorAnswer}
+            isCelebrating={readingTutorCelebrating}
+            unfamiliarWords={readingTutorUnfamiliarWords}
+            onStoryWordTap={handleReadingTutorStoryWordTap}
+            onPlayWord={handleReadingTutorStoryWordTap}
+            onStartWordReview={startReadingTutorWordReview}
+            isWordReviewing={readingTutorWordReviewInProgress}
+            isWordReviewCompleted={readingTutorWordReviewCompleted}
+            showQuestions={false}
+            readingDoneSignal={readingTutorReadingDoneSignal}
+            discussionQuestion={readingTutorDiscussionQuestion}
+            discussionDone={readingTutorDiscussionDone}
+            onOpenWritingJournal={goToStoryPreview}
+          />
+        )}
 
-                  <div className="flex flex-col sm:flex-row sm:items-center gap-4 pt-2">
-                    <button
-                      onClick={toggleListening}
-                      data-testid="home-mic-button"
-                      className={`relative inline-flex h-20 w-20 items-center justify-center rounded-full border border-white/60 transition-all duration-300 ${isListening ? 'bg-red-500 scale-105 shadow-[0_18px_40px_rgba(239,68,68,0.3)]' : 'bg-[linear-gradient(135deg,_#1d4ed8,_#0f766e)] shadow-[0_18px_40px_rgba(29,78,216,0.25)] hover:scale-105'} `}
-                      aria-label={isListening ? 'Stop listening' : 'Start listening'}
-                    >
-                      <Mic className="text-white w-8 h-8" />
-                      {isListening && <span className="absolute inset-0 rounded-full bg-red-400 animate-ping opacity-75"></span>}
-                    </button>
-                    <div className="space-y-1">
-                      <p className="text-base font-black uppercase tracking-[0.22em] text-stone-900">Tap to begin</p>
-                      <p className="text-stone-600 text-base">Then say, “I want to start writing.”</p>
-                    </div>
-                  </div>
-                </div>
+        {view === 'spellingChampion' && (
+          <SpellingChampionView
+            onBackToMenu={goToLandingPage}
+            customMessage={featureCustomMessages['spelling-champion'] || ''}
+            linkedResources={getFeatureReferences('spelling-champion')}
+            cacheWords={spellingCache.words || []}
+            cacheExpiresAt={spellingCache.expiresAt || 0}
+            cloudWordsError={cloudWordBanks['spelling-champion']?.error || ''}
+            isCloudWordsLoading={Boolean(cloudWordBanks['spelling-champion']?.isLoading)}
+            spellingActionMessage={featureActionMessage}
+            spellingPracticeOpen={spellingPracticeState.open}
+            practiceWord={spellingCache.words[spellingPracticeState.index] || ''}
+            spellingQuizOpen={spellingQuizState.open}
+            quizQuestionIndex={spellingQuizState.index}
+            quizTotal={spellingQuizState.words.length || 10}
+            quizPromptWord={spellingQuizState.words[spellingQuizState.index] || ''}
+            quizAnswer={spellingQuizState.answer}
+            quizFeedback={spellingQuizState.feedback}
+            quizAwaitingVoice={spellingQuizState.awaitingVoiceAnswer}
+            historyRows={spellingHistory}
+            onLoadCloudWords={loadSpellingWordsToCache}
+            onStartPractice={startSpellingPracticeLoop}
+            onStopPractice={stopSpellingPracticeLoop}
+            onStartQuiz={startSpellingQuiz}
+            onCloseQuiz={closeSpellingQuiz}
+            onQuizAnswerChange={(value) => setSpellingQuizState((prev) => ({ ...prev, answer: value }))}
+            onQuizSubmit={submitSpellingQuizAnswer}
+            onQuizRepeat={repeatCurrentSpellingQuestion}
+            onQuizSpeakAnswer={() => {
+              setSpellingQuizState((prev) => ({ ...prev, awaitingVoiceAnswer: true }));
+              startListening();
+            }}
+          />
+        )}
 
-                <div className="relative mx-auto w-full max-w-md">
-                  <div className="absolute -inset-3 rounded-[2.5rem] bg-[linear-gradient(145deg,_rgba(255,255,255,0.75),_rgba(255,255,255,0.15))] blur-xl" />
-                  <div className="relative overflow-hidden rounded-[2.5rem] border border-white/80 bg-stone-950 p-6 text-white shadow-[0_30px_60px_rgba(25,25,25,0.18)]">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-xs uppercase tracking-[0.35em] text-amber-200/70 font-bold">Session Flow</p>
-                        <p className="mt-2 text-2xl font-black tracking-tight">From speaking to writing</p>
-                      </div>
-                      <div className="rounded-full bg-white/10 px-3 py-1 text-xs font-bold uppercase tracking-[0.2em] text-amber-100">
-                        {grade}
-                      </div>
-                    </div>
+        {view === 'sightwordsMaster' && (
+          <SightwordsMasterView
+            onBackToMenu={goToLandingPage}
+            customMessage={featureCustomMessages['sightwords-master'] || ''}
+            linkedResources={getFeatureReferences('sightwords-master')}
+            bankWords={featureWordBanks['sightwords-master']?.words || []}
+            bankError={featureWordBanks['sightwords-master']?.error || ''}
+            isBankLoading={Boolean(featureWordBanks['sightwords-master']?.isLoading)}
+            onLoadCloudWords={() => loadCloudWordsToFeatureBank('sightwords-master')}
+            onRefreshWordBank={() => loadFeatureWordBankState('sightwords-master')}
+            onUpsertWord={(word, reviewFrequency) => upsertFeatureWordBankEntry({ featureId: 'sightwords-master', word, reviewFrequency })}
+            onRemoveWord={(word) => removeFeatureWordBankEntry({ featureId: 'sightwords-master', word })}
+            onStart={() => startFeaturePracticeSession('sightwords-master')}
+            isSessionActive={featurePracticeSession.active && featurePracticeSession.featureId === 'sightwords-master'}
+            currentWord={(featurePracticeSession.active && featurePracticeSession.featureId === 'sightwords-master') ? (featurePracticeSession.words[featurePracticeSession.index]?.word || '') : ''}
+            sessionHint={featurePracticeSession.feedback || 'You can say "i do not know" or "next" to skip this word.'}
+            featureActionMessage={featureActionMessage}
+          />
+        )}
 
-                    {isLocal && (
-                      <div className={`mt-4 inline-flex rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-[0.18em] ${getLiveStatusMeta().className}`} title={getLiveStatusMeta().detail}>
-                        {getLiveStatusMeta().label}
-                      </div>
-                    )}
-
-                    {isLocal && (
-                      <div className="mt-4 rounded-[1.4rem] border border-white/10 bg-white/10 p-4 text-left backdrop-blur-sm">
-                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-amber-100/70">Local debug</p>
-                        <div className="mt-3 space-y-2 text-xs text-stone-200">
-                          {getLocalDebugRows().map((row) => (
-                            <div key={row.label} className="flex items-start justify-between gap-3">
-                              <span className="shrink-0 font-black uppercase tracking-[0.16em] text-amber-100/70">{row.label}</span>
-                              <span className="text-right text-stone-100">{row.value}</span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="mt-6 space-y-3">
-                      {[
-                        ['01', 'Talk it out', 'Speak naturally and let the app catch the moment.'],
-                        ['02', 'Shape the idea', 'Prompt cards guide who, what, when, where, why, and how.'],
-                        ['03', 'Write with confidence', 'Use the finished story and spelling help on paper.']
-                      ].map(([num, title, copy]) => (
-                        <div key={num} className="rounded-[1.5rem] border border-white/10 bg-white/5 p-4 text-left">
-                          <div className="flex items-start gap-4">
-                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-amber-300 text-stone-900 font-black">
-                              {num}
-                            </div>
-                            <div>
-                              <p className="text-lg font-black">{title}</p>
-                              <p className="mt-1 text-sm leading-6 text-stone-300">{copy}</p>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="mt-6 rounded-[1.6rem] bg-white/10 p-4 text-left backdrop-blur-sm">
-                      <p className="text-xs uppercase tracking-[0.28em] text-amber-100/70 font-bold">Today’s prompt</p>
-                      <p className="mt-2 text-xl font-black leading-tight">What was the best part of your day, and who shared it with you?</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {isGuidedStep && (
-              <div className="w-full space-y-8 animate-in slide-in-from-right-4 duration-500 text-left">
-                <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
-                  <div className="max-w-2xl space-y-3">
-                    <div className="inline-flex items-center gap-2 rounded-full border border-orange-200 bg-white/80 px-4 py-2 text-[11px] font-bold uppercase tracking-[0.3em] text-orange-700 shadow-sm">
-                      <BookOpen size={14} className="text-orange-500" />
-                      Story builder
-                    </div>
-                    <h2 className="text-4xl md:text-5xl font-black text-stone-900 tracking-[-0.04em] capitalize">{step} matters.</h2>
-                    <p className="text-lg md:text-xl text-stone-600 font-medium leading-relaxed">{getStepQuestion(step, answers)}</p>
-                  </div>
-
-                  <div className="rounded-[2rem] border border-white/80 bg-white/70 px-5 py-4 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm min-w-[220px]">
-                    <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Current mode</p>
-                    <p className="mt-2 text-2xl font-black text-stone-900">{isConfirming ? 'Confirming' : 'Listening for ideas'}</p>
-                    <p className="mt-2 text-sm leading-6 text-stone-600">
-                      {isConfirming ? 'Check the answer before we move to the next prompt.' : step === 'story' ? 'Start with a quick retell, then we will break it into simple questions.' : 'Say the answer out loud, then we’ll help shape it.'}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-4 mb-2">
-                   {canGoToPreviousQuestion ? (
-                     <button onClick={moveToPrevStep} className="p-2.5 bg-white/80 rounded-full hover:bg-white transition-colors shadow-sm ring-1 ring-stone-200"><ArrowLeft size={20}/></button>
-                   ) : (
-                     <div className="w-9" />
-                   )}
-                   <div className="flex gap-2 flex-1">
-                    {fiveWSteps.map(s => (
-                      <div key={s} className={`h-3 flex-1 rounded-full transition-all duration-500 ${step === s ? 'bg-blue-500 shadow-md' : answers[s] ? 'bg-green-400' : 'bg-gray-100'}`} />
-                    ))}
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <button
-                    onClick={moveToPrevStep}
-                    className={`inline-flex items-center justify-center gap-2 rounded-full px-5 py-3 text-sm font-black uppercase tracking-[0.18em] transition-all ${
-                      canGoToPreviousQuestion
-                        ? 'bg-white text-stone-800 shadow-sm ring-1 ring-stone-200 hover:bg-stone-50'
-                        : 'bg-stone-100 text-stone-500 hover:bg-stone-200'
-                    }`}
-                  >
-                    <ArrowLeft size={16} />
-                    {canGoToPreviousQuestion ? 'Previous Question' : 'Back Home'}
-                  </button>
-                  <p className="text-sm font-semibold text-stone-500">
-                    {canGoToPreviousQuestion
-                      ? 'Need to fix something? Go back one question without losing the flow.'
-                      : 'Start with a quick story idea. Tap to leave this flow and return home.'}
-                  </p>
-                </div>
-                
-                <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr] items-stretch">
-                  <div className={`p-8 md:p-10 rounded-[2.5rem] min-h-[220px] flex items-center text-left text-3xl md:text-4xl font-bold italic border transition-all duration-300 shadow-[0_18px_40px_rgba(148,101,47,0.08)] ${isConfirming ? 'bg-[linear-gradient(180deg,_#fff4e8,_#fff8f1)] text-orange-900 border-orange-100' : 'bg-[linear-gradient(180deg,_#eef7ff,_#f5fbff)] text-sky-900 border-sky-100'}`}>
-                    {userInput || (
-                      <span className="not-italic text-xl md:text-2xl font-semibold text-stone-400">
-                        {isListening ? (isMockMode ? "Mocking input..." : "Listening for your answer...") : 'Tap the microphone and answer in your own words.'}
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="rounded-[2.5rem] border border-white/80 bg-white/75 p-6 shadow-[0_18px_40px_rgba(148,101,47,0.08)] backdrop-blur-sm flex flex-col justify-between">
-                    <div>
-                      <p className="text-xs uppercase tracking-[0.3em] text-stone-500 font-bold">Why this helps</p>
-                      <p className="mt-3 text-2xl font-black text-stone-900">
-                        {isConfirming ? 'We pause to make sure the story stays true.' : 'One clear detail makes the final journal easier to write.'}
-                      </p>
-                    </div>
-                    <div className="mt-6 grid grid-cols-3 gap-3">
-                      {getFlowSummaryCards().map((card) => (
-                        <div key={card.label} className={`rounded-[1.25rem] px-3 py-4 text-center ${card.active ? 'bg-orange-100 text-orange-900' : 'bg-stone-100 text-stone-500'}`}>
-                          <p className="text-[11px] font-black uppercase tracking-[0.14em]">{card.label}</p>
-                          <p className="mt-2 text-sm font-black capitalize">{card.value}</p>
-                        </div>
-                      ))}
-                    </div>
-
-                    {isLocal && (
-                      <div className="mt-6 rounded-[1.4rem] border border-stone-200 bg-stone-900 p-4 text-left text-white">
-                        <p className="text-[10px] font-black uppercase tracking-[0.24em] text-stone-300">Local debug</p>
-                        <div className="mt-3 space-y-2 text-xs text-stone-100">
-                          {getLocalDebugRows().map((row) => (
-                            <div key={row.label} className="flex items-start justify-between gap-3">
-                              <span className="shrink-0 font-black uppercase tracking-[0.16em] text-stone-400">{row.label}</span>
-                              <span
-                                className="text-right text-stone-100"
-                                data-testid={`debug-${row.label.toLowerCase().replace(/\s+/g, '-')}`}
-                              >
-                                {row.value}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* {isConfirming ? (
-                  <div className="space-y-6 flex flex-col items-center min-h-[300px] justify-center">
-                    <div className="flex items-center gap-2 text-orange-500 font-black text-xl uppercase animate-pulse"><CheckCircle2 /> Confirm??</div>
-                    <div className="bg-orange-50 p-8 rounded-[2rem] border-4 border-orange-100 text-3xl font-bold text-orange-800 italic w-full shadow-inner">"{answers[step]}"</div>
-                  </div>
-                ) : (
-                  <div className="space-y-6 min-h-[300px] flex flex-col justify-center">
-                    <h2 className="text-6xl font-black text-blue-600 capitalize tracking-tight">{step}?</h2>
-                    <p className="text-2xl text-gray-500 font-bold px-4">{getStepQuestion(step)}</p>
-                    <div className="bg-blue-50 p-8 rounded-[2rem] min-h-[120px] flex items-center justify-center text-3xl font-bold text-blue-800 italic border-4 border-blue-100 shadow-inner mx-4">
-                      {userInput || (isListening ? (isMockMode ? "Mocking input..." : "Listening...") : "Click the microphone to speak")}
-                    </div>
-                  </div>
-                )} */}
-
-                <div className="mt-auto pb-4 flex flex-col items-center gap-4">
-                  <button onClick={() => {stopListening(); startListening();}} data-testid="guided-mic-button" className={`w-20 h-20 md:w-24 md:h-24 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 relative border border-white/70 ${isListening ? 'bg-red-500 scale-105 shadow-red-200' : 'bg-[linear-gradient(135deg,_#1d4ed8,_#0f766e)] hover:scale-105 active:scale-95 shadow-blue-200'}`}>
-                    <Mic className="text-white w-8 h-8 md:w-9 md:h-9" />
-                    {isListening && <span className="absolute inset-0 rounded-full bg-red-400 animate-ping opacity-75"></span>}
-                  </button>
-                  <p className="text-stone-500 font-black text-sm md:text-base uppercase tracking-[0.2em] h-6 text-center">
-                    {isListening ? "I'm listening..." : (userInput ? "Tap to record again" : "Tap to speak")}
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {step === 'generating' && (
-              <div className="py-20 flex flex-col items-center space-y-6">
-                <RefreshCw className="w-20 h-20 text-blue-500 animate-spin" />
-                <p className="text-2xl font-bold text-gray-600">Polishing your story...</p>
-              </div>
-            )}
-
-            {step === 'result' && (
-              <div className="w-full space-y-8 animate-in fade-in">
-                <div className="bg-orange-50 p-8 rounded-[2.5rem] border-4 border-orange-100 text-left relative shadow-inner">
-                  <button onClick={() => speakText(generatedJournal)} className="absolute top-4 right-4 p-3 bg-white rounded-full shadow-md"><Volume2 className="text-orange-500 w-6 h-6" /></button>
-                  <p className="text-2xl leading-relaxed font-bold text-gray-800 pr-10 text-left">{generatedJournal}</p>
-                </div>
-                {/* Illustration preview intentionally disabled for now.
-                <div className="rounded-[2.5rem] overflow-hidden shadow-2xl border-8 border-white bg-gray-50 min-h-[300px] flex items-center justify-center">
-                  {isGeneratingImage ? (
-                    <div className="flex flex-col items-center gap-4 text-gray-400 font-bold">
-                       <RefreshCw className="animate-spin" size={48} />
-                       <span>Painting... 🎨</span>
-                    </div>
-                  ) : imageUrl ? (
-                    <img src={imageUrl} alt="Journal Illustration" className="w-full h-auto object-cover" />
-                  ) : (
-                    <div className="flex flex-col items-center text-gray-300">
-                      <span className="font-bold">No illustration available</span>
-                    </div>
-                  )}
-                </div>
-                */}
-                <div className="flex gap-4">
-                  <button onClick={() => setStep('idle')} className="flex-1 py-5 bg-gray-100 rounded-2xl font-black text-gray-500">Restart</button>
-                  <button onClick={goToWritingPage} className="flex-1 py-5 bg-green-500 text-white rounded-2xl font-black text-xl shadow-lg flex items-center justify-center gap-2">Start Writing <ChevronRight /></button>
-                </div>
-              </div>
-            )}
-          </div>
+        {view === 'chineseLiteracy' && (
+          <ChineseLiteracyView
+            onBackToMenu={goToLandingPage}
+            customMessage={featureCustomMessages['chinese-literacy'] || ''}
+            linkedResources={getFeatureReferences('chinese-literacy')}
+            bankWords={featureWordBanks['chinese-literacy']?.words || []}
+            bankError={featureWordBanks['chinese-literacy']?.error || ''}
+            isBankLoading={Boolean(featureWordBanks['chinese-literacy']?.isLoading)}
+            onLoadCloudWords={() => loadCloudWordsToFeatureBank('chinese-literacy')}
+            onRefreshWordBank={() => loadFeatureWordBankState('chinese-literacy')}
+            onUpsertWord={(word, reviewFrequency) => upsertFeatureWordBankEntry({ featureId: 'chinese-literacy', word, reviewFrequency })}
+            onRemoveWord={(word) => removeFeatureWordBankEntry({ featureId: 'chinese-literacy', word })}
+            onStart={() => startFeaturePracticeSession('chinese-literacy')}
+            isSessionActive={featurePracticeSession.active && featurePracticeSession.featureId === 'chinese-literacy'}
+            currentWord={(featurePracticeSession.active && featurePracticeSession.featureId === 'chinese-literacy') ? (featurePracticeSession.words[featurePracticeSession.index]?.word || '') : ''}
+            sessionHint={featurePracticeSession.feedback || '你可以說 i do not know 或 next 來跳過。'}
+            featureActionMessage={featureActionMessage}
+          />
         )}
 
         {view === 'journaling' && (
-          <div className="flex-1 flex flex-col space-y-6 animate-in slide-in-from-bottom-6 h-full">
-            {/* Header for writing view */}
-            <div className="flex flex-col gap-4 px-2 flex-shrink-0 lg:flex-row lg:items-center lg:justify-between">
-                <div className="flex items-center gap-2">
-                    <Sparkles className="text-orange-400" size={24} />
-                    <div>
-                      <h2 className="text-2xl font-black text-gray-700">Writing Time</h2>
-                      <p className="text-sm font-semibold text-gray-400">Keep the story handy while you write on paper.</p>
-                    </div>
-                </div>
-            </div>
-
-            {/* Key Idea Area - Yellow Sticky Note Style */}
-            <div className="bg-yellow-50 p-6 rounded-[2rem] border-2 border-yellow-200 shadow-sm relative flex-shrink-0">
-                <div className="flex justify-between items-center mb-2">
-                    <p className="text-xs text-yellow-800 font-black uppercase tracking-widest">💡 Key Idea:</p>
-                    <button onClick={() => speakText(generatedJournal)} className="p-2 bg-white rounded-full shadow-sm hover:scale-110 transition-transform">
-                        <Volume2 className="text-orange-500 w-5 h-5" />
-                    </button>
-                </div>
-                <p className="text-xl text-yellow-900 font-bold leading-relaxed pr-2 text-left">
-                    {generatedJournal}
-                </p>
-            </div>
-
-            {/* Illustration area intentionally disabled for now.
-            <div className="flex-1 rounded-[2.5rem] overflow-hidden border-8 border-white shadow-lg bg-gray-50 flex items-center justify-center relative min-h-[280px]">
-                <img src={imageUrl} alt="Journal Illustration" className="w-full h-full object-cover" />
-                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-sm px-4 py-1 rounded-full text-xs font-bold text-gray-500">
-                    Drawing Idea
-                </div>
-            </div>
-            */}
-
-            {/* Bottom Actions */}
-            <div className="space-y-4 flex-shrink-0">
-              {spellResult && (
-                <div className="p-4 bg-green-500 text-white rounded-3xl shadow-xl animate-bounce font-black text-2xl text-center w-full">
-                    {spellResult}
-                </div>
-              )}
-
-              <p className="text-center text-sm font-semibold text-stone-500">
-                Say “how do I spell …” any time and Writing Buddy will spell it slowly.
-              </p>
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-                <button
-                  onClick={goToStoryPreview}
-                  className="min-w-0 rounded-[1.75rem] bg-white px-4 py-4 text-sm font-black uppercase tracking-[0.14em] text-stone-700 shadow-sm ring-1 ring-stone-200 transition-colors hover:bg-stone-50 flex items-center justify-center gap-2"
-                >
-                  <ArrowLeft size={16} />
-                  Back
-                </button>
-
-                <button onClick={handleSpellAssistPress} className={`invisible min-w-0 px-4 py-4 rounded-[1.75rem] shadow-lg flex items-center justify-center gap-3 transition-all ${isListening ? 'bg-red-500 scale-[1.02]' : 'bg-blue-600 hover:bg-blue-700'} text-white`}>
-                    <Mic className="w-6 h-6 flex-shrink-0" />
-                    <div className="text-left min-w-0">
-                        <p className="font-black text-sm leading-none uppercase tracking-[0.12em]">Spell</p>
-                        <p className="text-[10px] opacity-70 truncate">Slow letter-by-letter help</p>
-                    </div>
-                </button>
-
-                <button
-                  onClick={goToHomePage}
-                  className="min-w-0 rounded-[1.75rem] bg-stone-100 px-4 py-4 text-sm font-black uppercase tracking-[0.14em] text-stone-700 transition-colors hover:bg-stone-200 flex items-center justify-center gap-2"
-                >
-                  <BookOpen size={16} />
-                  Home
-                </button>
-              </div>
-            </div>
-          </div>
+          <WritingJournalView
+            generatedJournal={generatedJournal}
+            spellResult={spellResult}
+            isListening={isListening}
+            onSpeakText={speakText}
+            onBack={goToStoryPreview}
+            onSpellAssist={handleSpellAssistPress}
+            onHome={goToHomePage}
+            onBackToMenu={goToLandingPage}
+          />
         )}
 
         {showUploadModal && (
