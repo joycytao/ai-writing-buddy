@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cloud OAuth Callback</title>
+  </head>
+  <body>
+    <p style="font-family: sans-serif; padding: 16px;">Completing cloud connection...</p>
+    <script>
+      (function () {
+        var hash = window.location.hash && window.location.hash.length > 1 ? window.location.hash.slice(1) : '';
+        var params = new URLSearchParams(hash);
+
+        var payload = {
+          type: 'cloud-oauth-callback',
+          state: params.get('state') || '',
+          accessToken: params.get('access_token') || '',
+          expiresIn: params.get('expires_in') || '0',
+          error: params.get('error') || params.get('error_description') || '',
+        };
+
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage(payload, window.location.origin);
+        }
+
+        window.close();
+      })();
+    </script>
+  </body>
+</html>

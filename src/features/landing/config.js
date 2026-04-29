@@ -1,0 +1,45 @@
+export const featureCards = [
+  {
+    id: 'reading-tutor',
+    view: 'readingTutor',
+    title: 'Reading Tutor',
+    subtitle: 'Real-time reading coach',
+    detail: 'Voice-first reading practice with gentle correction and pronunciation support.',
+  },
+  {
+    id: 'story-a-day',
+    view: 'storyADay',
+    title: 'A Story a Day',
+    subtitle: 'Daily story coach',
+    detail: 'Auto-picks today\'s story and guides vocabulary + understanding by voice.',
+    hiddenFromLanding: true,
+  },
+  {
+    id: 'writing-journal',
+    view: 'home',
+    title: 'Writing Journal',
+    subtitle: 'Current writing flow',
+    detail: 'Use the existing guided story flow and then move to writing practice.',
+  },
+  {
+    id: 'spelling-champion',
+    view: 'spellingChampion',
+    title: 'Spelling Champion',
+    subtitle: 'Fun weekly spelling prep',
+    detail: 'Practice spelling words by voice with hints and encouragement.',
+  },
+  {
+    id: 'sightwords-master',
+    view: 'sightwordsMaster',
+    title: 'Sightwords Master',
+    subtitle: 'Leitner review mode',
+    detail: 'Review and master sight words with spaced repetition scheduling.',
+  },
+  {
+    id: 'chinese-literacy',
+    view: 'chineseLiteracy',
+    title: '識字高手',
+    subtitle: 'Traditional Chinese mode',
+    detail: 'Practice Traditional Chinese characters with voice-guided review.',
+  },
+];

@@ -19,10 +19,14 @@ import CloudReferenceSettings from './features/cloud-references/CloudReferenceSe
 import { loadWordsFromLinkedReferences, clearWordsCacheForReferences, loadWorksheetTextFromLinkedReferences, loadWorksheetTargetTextFromLinkedReferences, loadWorksheetSourceFileFromLinkedReferences } from './features/cloud-references/documentWordLoader';
 import { parseWorksheetDocument, getWorksheetUnitForDate, extractWorksheetSectionForWeekDay } from './features/reading-tutor/worksheetParser';
 import {
+  cleanupExpiredCloudReferences,
   loadCloudReferenceState,
+  loadSpellingCacheState,
   removeCloudReference,
+  removeSpellingCacheState,
   saveCloudConnections,
   saveCloudReference,
+  saveSpellingCacheState,
   loadFeatureWordBank,
   upsertFeatureWord,
   upsertFeatureWords,
@@ -159,9 +163,26 @@ const normalizeFeatureId = (value = '') => {
   return raw;
 };
 
+const REFERENCE_METADATA_TTL_MS = 24 * 60 * 60 * 1000;
+
+const getReferenceMetadataExpiryMs = (resource = {}) => {
+  const explicitExpiryIso = String(resource.metadataExpiresAtIso || '').trim();
+  const explicitExpiryMs = explicitExpiryIso ? Date.parse(explicitExpiryIso) : NaN;
+  if (Number.isFinite(explicitExpiryMs)) return explicitExpiryMs;
+
+  const createdAtIso = String(resource.createdAtIso || '').trim();
+  const createdAtMs = createdAtIso ? Date.parse(createdAtIso) : NaN;
+  if (Number.isFinite(createdAtMs)) return createdAtMs + REFERENCE_METADATA_TTL_MS;
+
+  return Date.now() + REFERENCE_METADATA_TTL_MS;
+};
+
+const isReferenceMetadataExpired = (resource = {}) => Date.now() >= getReferenceMetadataExpiryMs(resource);
+
 const normalizeLinkedResource = (resource = {}) => ({
   ...resource,
   feature: normalizeFeatureId(resource.feature || ''),
+  metadataExpiresAtIso: new Date(getReferenceMetadataExpiryMs(resource)).toISOString(),
 });
 
 const createLinkedResourceDedupKey = (resource = {}) => {
@@ -519,6 +540,7 @@ const shuffled = (items = []) => {
     feedback: '',
     awaitingVoiceAnswer: false,
   });
+  const [spellingQuizInputFocusNonce, setSpellingQuizInputFocusNonce] = useState(0);
   const [featureActionMessage, setFeatureActionMessage] = useState('');
   const [readingTutorFeedback, setReadingTutorFeedback] = useState('');
   const [readingPracticeFeatureId, setReadingPracticeFeatureId] = useState('reading-tutor');
@@ -729,11 +751,27 @@ const shuffled = (items = []) => {
   useEffect(() => {
     if (!spellingCache?.words?.length || !spellingCache.expiresAt || Date.now() > spellingCache.expiresAt) {
       localStorage.removeItem(SPELLING_CACHE_KEY);
+      if (user?.uid) {
+        removeSpellingCacheState({ db, appId, uid: user.uid }).catch((error) => {
+          console.error('Could not remove expired spelling cache from Firestore:', error);
+        });
+      }
       return;
     }
 
     localStorage.setItem(SPELLING_CACHE_KEY, JSON.stringify(spellingCache));
-  }, [spellingCache]);
+    if (user?.uid) {
+      saveSpellingCacheState({
+        db,
+        appId,
+        uid: user.uid,
+        words: spellingCache.words,
+        expiresAt: spellingCache.expiresAt,
+      }).catch((error) => {
+        console.error('Could not sync spelling cache to Firestore:', error);
+      });
+    }
+  }, [spellingCache, user?.uid]);
 
   useEffect(() => {
     localStorage.setItem(SPELLING_HISTORY_KEY, JSON.stringify(spellingHistory));
@@ -769,10 +807,36 @@ const shuffled = (items = []) => {
           appId,
           uid: user.uid,
         });
+        const cleanupResult = await cleanupExpiredCloudReferences({
+          db,
+          appId,
+          uid: user.uid,
+        });
+        const removedByCleanup = new Set(cleanupResult?.removedReferenceIds || []);
+        const normalizedReferences = dedupeLinkedResources((cloudState.references || []).map(normalizeLinkedResource));
+        const activeReferences = normalizedReferences.filter((reference) => {
+          if (removedByCleanup.has(reference.id)) return false;
+          return !isReferenceMetadataExpired(reference);
+        });
+        const locallyExpiredReferenceIds = normalizedReferences
+          .filter((reference) => isReferenceMetadataExpired(reference))
+          .map((reference) => reference.id)
+          .filter(Boolean);
+
+        if (locallyExpiredReferenceIds.length > 0) {
+          await Promise.all(
+            locallyExpiredReferenceIds.map((referenceId) => removeCloudReference({
+              db,
+              appId,
+              uid: user.uid,
+              referenceId,
+            }))
+          );
+        }
 
         if (!isMounted) return;
         setCloudConnections(cloudState.connections);
-        setLinkedResources(dedupeLinkedResources((cloudState.references || []).map(normalizeLinkedResource)));
+        setLinkedResources(activeReferences);
         hasLoadedCloudStateRef.current = true;
       } catch (error) {
         console.error('Could not load cloud reference state from Firestore:', error);
@@ -787,6 +851,27 @@ const shuffled = (items = []) => {
       isMounted = false;
     };
   }, [view, user?.uid]);
+
+  useEffect(() => {
+    const expiredReferences = linkedResources.filter((resource) => isReferenceMetadataExpired(resource));
+    if (expiredReferences.length === 0) return;
+
+    const expiredReferenceIds = new Set(expiredReferences.map((resource) => resource.id).filter(Boolean));
+    setLinkedResources((prev) => prev.filter((resource) => !expiredReferenceIds.has(resource.id)));
+
+    if (user?.uid) {
+      Promise.all(
+        [...expiredReferenceIds].map((referenceId) => removeCloudReference({
+          db,
+          appId,
+          uid: user.uid,
+          referenceId,
+        }))
+      ).catch((error) => {
+        console.error('Could not remove expired cloud references:', error);
+      });
+    }
+  }, [linkedResources, user?.uid]);
 
   useEffect(() => {
     if (view !== 'setup') return;
@@ -1071,6 +1156,7 @@ const shuffled = (items = []) => {
       modifiedTime: linkDraft.selectedModifiedTime || '',
       derivedWords: [],
       createdAtIso: new Date().toISOString(),
+      metadataExpiresAtIso: new Date(Date.now() + REFERENCE_METADATA_TTL_MS).toISOString(),
     };
 
     setLinkedResources((prev) => dedupeLinkedResources([nextResource, ...prev]));
@@ -1427,8 +1513,11 @@ const shuffled = (items = []) => {
 
     const firstWord = questionWords[0] || '';
     if (firstWord) {
-      speakText(`Spell this word: ${firstWord}`);
+      void speakText(`Spell this word: ${firstWord}`).finally(() => {
+        setSpellingQuizInputFocusNonce((prev) => prev + 1);
+      });
     }
+    setSpellingQuizInputFocusNonce((prev) => prev + 1);
   };
 
   const closeSpellingQuiz = () => {
@@ -1497,6 +1586,7 @@ const shuffled = (items = []) => {
     if (nextWord) {
       await speakText(`Next word: ${nextWord}`);
     }
+    setSpellingQuizInputFocusNonce((prev) => prev + 1);
   };
 
   const repeatCurrentSpellingQuestion = async () => {
@@ -4230,6 +4320,25 @@ General rules:
     if (view === 'chineseLiteracy') {
       void loadFeatureWordBankState('chinese-literacy');
     }
+    if (view === 'spellingChampion') {
+      loadSpellingCacheState({
+        db,
+        appId,
+        uid: user.uid,
+      }).then((remoteCache) => {
+        const remoteExpiresAt = Number(remoteCache?.expiresAt || 0);
+        const remoteWords = Array.isArray(remoteCache?.words) ? remoteCache.words : [];
+        if (!remoteExpiresAt || Date.now() > remoteExpiresAt || remoteWords.length === 0) return;
+
+        const localExpiresAt = Number(spellingCache?.expiresAt || 0);
+        if (remoteExpiresAt >= localExpiresAt) {
+          setSpellingCache({ words: remoteWords, expiresAt: remoteExpiresAt });
+          setFeatureActionMessage('Loaded your 7-day spelling cache from cloud sync.');
+        }
+      }).catch((error) => {
+        console.error('Could not load spelling cache from Firestore:', error);
+      });
+    }
   }, [view, user?.uid]);
 
   useEffect(() => {
@@ -4717,6 +4826,7 @@ General rules:
             quizAnswer={spellingQuizState.answer}
             quizFeedback={spellingQuizState.feedback}
             quizAwaitingVoice={spellingQuizState.awaitingVoiceAnswer}
+            quizFocusNonce={spellingQuizInputFocusNonce}
             historyRows={spellingHistory}
             onLoadCloudWords={loadSpellingWordsToCache}
             onStartPractice={startSpellingPracticeLoop}

@@ -1,0 +1,36 @@
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+
+# Firebase
+.firebase/
+.firebaserc
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+playwright-report/
+test-results/
+
+# Media files
+*.mov
+*.mp4
+*.avi
+*.mkv
+
+# OS / editor noise
+.DS_Store
+*.local
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Lock files (Claude doesn't need these)
+package-lock.json
